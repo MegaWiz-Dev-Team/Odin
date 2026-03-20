@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏛️ Odin — Security Command Center</title>
+    <meta name="description" content="Odin Dashboard — Unified security pipeline for Huginn (scan), Muninn (fix), and Forseti (test)">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #f8fffe;
+            --surface: #ffffff;
+            --surface-hover: #f0fdf4;
+            --mint: #10b981;
+            --mint-light: #d1fae5;
+            --mint-dark: #065f46;
+            --mint-glow: rgba(16, 185, 129, 0.15);
+            --text: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --danger: #ef4444;
+            --danger-light: #fee2e2;
+            --warning: #f59e0b;
+            --warning-light: #fef3c7;
+            --info: #3b82f6;
+            --info-light: #dbeafe;
+            --success: #10b981;
+            --success-light: #d1fae5;
+            --radius: 12px;
+            --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+            --shadow-lg: 0 10px 30px rgba(0,0,0,0.08);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        /* ── Header ── */
+        .header {
+            background: linear-gradient(135deg, var(--mint-dark) 0%, #047857 50%, var(--mint) 100%);
+            color: white;
+            padding: 1.5rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 4px 20px rgba(16, 185, 129, 0.3);
+        }
+        .header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+        .header h1 span { font-size: 1.8rem; margin-right: 0.5rem; }
+        .header-subtitle { font-size: 0.85rem; opacity: 0.85; margin-top: 2px; }
+        .header-right { display: flex; gap: 1rem; align-items: center; }
+        .badge {
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-review { background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); }
+        .badge-auto { background: var(--mint-light); color: var(--mint-dark); }
+
+        /* ── Config Bar ── */
+        .config-bar {
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: 0.75rem 2rem;
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            overflow-x: auto;
+        }
+        .config-item { display: flex; gap: 0.4rem; align-items: center; white-space: nowrap; }
+        .config-item strong { color: var(--text); font-weight: 500; }
+
+        /* ── Stats Grid ── */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1rem;
+            padding: 1.5rem 2rem;
+        }
+        .stat-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.25rem;
+            box-shadow: var(--shadow);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+        .stat-value { font-size: 2rem; font-weight: 700; color: var(--mint); }
+        .stat-label { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
+        .stat-card.danger .stat-value { color: var(--danger); }
+        .stat-card.warning .stat-value { color: var(--warning); }
+        .stat-card.info .stat-value { color: var(--info); }
+
+        /* ── Tabs ── */
+        .tabs {
+            display: flex;
+            gap: 0;
+            padding: 0 2rem;
+            border-bottom: 2px solid var(--border);
+            background: var(--surface);
+        }
+        .tab {
+            padding: 0.8rem 1.5rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s;
+            user-select: none;
+        }
+        .tab:hover { color: var(--mint); background: var(--mint-glow); }
+        .tab.active { color: var(--mint-dark); border-bottom-color: var(--mint); font-weight: 600; }
+
+        /* ── Main Content ── */
+        .content { padding: 1.5rem 2rem; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* ── Issues Table ── */
+        .issues-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            background: var(--surface);
+            border-radius: var(--radius);
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+        .issues-table th {
+            background: var(--mint-light);
+            color: var(--mint-dark);
+            padding: 0.75rem 1rem;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .issues-table td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.85rem;
+        }
+        .issues-table tr:hover td { background: var(--surface-hover); }
+        .issues-table tr:last-child td { border-bottom: none; }
+
+        /* ── Status Badges ── */
+        .status-badge {
+            padding: 0.2rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .status-pending { background: var(--info-light); color: var(--info); }
+        .status-analyzing { background: var(--warning-light); color: var(--warning); }
+        .status-review_pending { background: #fdf4ff; color: #a855f7; border: 1px solid #e9d5ff; }
+        .status-fixing { background: var(--warning-light); color: var(--warning); }
+        .status-fixed { background: var(--success-light); color: var(--success); }
+        .status-skipped { background: #f1f5f9; color: #94a3b8; }
+        .status-failed { background: var(--danger-light); color: var(--danger); }
+
+        .priority-critical { color: var(--danger); font-weight: 700; }
+        .priority-high { color: #dc2626; font-weight: 600; }
+        .priority-medium { color: var(--warning); font-weight: 500; }
+        .priority-low { color: var(--text-muted); }
+
+        /* ── Review Panel ── */
+        .review-panel {
+            background: var(--surface);
+            border: 2px solid #e9d5ff;
+            border-radius: var(--radius);
+            margin-top: 1.5rem;
+            overflow: hidden;
+            box-shadow: var(--shadow-lg);
+        }
+        .review-header {
+            background: linear-gradient(135deg, #f5f3ff, #fdf4ff);
+            padding: 1rem 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #e9d5ff;
+        }
+        .review-header h3 { color: #7c3aed; font-size: 1rem; }
+        .review-body { padding: 1.5rem; }
+        .review-analysis {
+            background: #f8fafc;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+            line-height: 1.6;
+        }
+        .review-analysis h4 { color: var(--mint-dark); margin-bottom: 0.5rem; }
+        .diff-view {
+            background: #1e1e2e;
+            color: #cdd6f4;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.8rem;
+            line-height: 1.6;
+            overflow-x: auto;
+            white-space: pre;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .diff-add { color: #a6e3a1; }
+        .diff-remove { color: #f38ba8; }
+        .review-actions {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1.5rem;
+            justify-content: flex-end;
+        }
+        .btn {
+            padding: 0.6rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .btn-approve {
+            background: var(--mint);
+            color: white;
+            box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+        }
+        .btn-approve:hover { background: #059669; transform: translateY(-1px); }
+        .btn-reject {
+            background: white;
+            color: var(--danger);
+            border: 1px solid var(--danger);
+        }
+        .btn-reject:hover { background: var(--danger-light); }
+        .btn-secondary {
+            background: white;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover { background: var(--surface-hover); }
+
+        /* ── Empty State ── */
+        .empty-state {
+            text-align: center;
+            padding: 3rem 2rem;
+            color: var(--text-muted);
+        }
+        .empty-state .icon { font-size: 3rem; margin-bottom: 1rem; }
+        .empty-state h3 { font-size: 1.1rem; color: var(--text); margin-bottom: 0.5rem; }
+
+        /* ── Responsive ── */
+        @media (max-width: 768px) {
+            .header { flex-direction: column; gap: 0.5rem; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .config-bar { flex-wrap: wrap; gap: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1><span>🏛️</span> Odin — Security Command Center</h1>
+            <div class="header-subtitle">Unified pipeline: Huginn (scan) → Muninn (fix) → Forseti (test)</div>
+        </div>
+        <div class="header-right">
+            <span class="badge badge-review" id="modeBadge">👁️ Review Mode</span>
+            <span id="lastUpdate" style="font-size:0.75rem;opacity:0.7"></span>
+        </div>
+    </div>
+
+    <div class="config-bar" id="configBar">
+        <div class="config-item">🤖 <strong>Agent:</strong> <span id="cfgAgent">—</span></div>
+        <div class="config-item">🧠 <strong>LLM:</strong> <span id="cfgLLM">—</span></div>
+        <div class="config-item">🌡️ <strong>Temp:</strong> <span id="cfgTemp">—</span></div>
+        <div class="config-item">📏 <strong>Tokens:</strong> <span id="cfgTokens">—</span></div>
+        <div class="config-item">📦 <strong>Repos:</strong> <span id="cfgRepos">—</span></div>
+        <div class="config-item">⏱️ <strong>Poll:</strong> <span id="cfgPoll">—</span></div>
+    </div>
+
+    <div class="stats-grid" id="statsGrid">
+        <div class="stat-card"><div class="stat-value" id="statTotal">—</div><div class="stat-label">Total Issues</div></div>
+        <div class="stat-card warning"><div class="stat-value" id="statReview">—</div><div class="stat-label">Pending Review</div></div>
+        <div class="stat-card"><div class="stat-value" id="statFixed">—</div><div class="stat-label">Fixed</div></div>
+        <div class="stat-card danger"><div class="stat-value" id="statFailed">—</div><div class="stat-label">Failed</div></div>
+        <div class="stat-card info"><div class="stat-value" id="statPending">—</div><div class="stat-label">Analyzing</div></div>
+    </div>
+
+    <div class="tabs">
+        <div class="tab active" data-tab="all" id="tabAll">📋 All Issues</div>
+        <div class="tab" data-tab="review" id="tabReview">👁️ Pending Review</div>
+        <div class="tab" data-tab="fixed" id="tabFixed">✅ Fixed</div>
+    </div>
+
+    <div class="content">
+        <!-- All Issues Tab -->
+        <div class="tab-content active" id="contentAll">
+            <table class="issues-table" id="allIssuesTable">
+                <thead>
+                    <tr>
+                        <th>Repo</th>
+                        <th>#</th>
+                        <th>Title</th>
+                        <th>Priority</th>
+                        <th>Status</th>
+                        <th>Updated</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="allIssuesBody"></tbody>
+            </table>
+            <div class="empty-state" id="emptyAll" style="display:none">
+                <div class="icon">🛡️</div>
+                <h3>No tracked issues</h3>
+                <p>Muninn is watching for Huginn findings. Issues will appear here automatically.</p>
+            </div>
+        </div>
+
+        <!-- Pending Review Tab -->
+        <div class="tab-content" id="contentReview">
+            <div id="reviewList"></div>
+            <div class="empty-state" id="emptyReview" style="display:none">
+                <div class="icon">✨</div>
+                <h3>No fixes pending review</h3>
+                <p>When Muninn generates a fix, it will appear here for your approval.</p>
+            </div>
+        </div>
+
+        <!-- Fixed Tab -->
+        <div class="tab-content" id="contentFixed">
+            <table class="issues-table" id="fixedTable">
+                <thead>
+                    <tr><th>Repo</th><th>#</th><th>Title</th><th>Priority</th><th>PR</th><th>Fixed At</th></tr>
+                </thead>
+                <tbody id="fixedBody"></tbody>
+            </table>
+            <div class="empty-state" id="emptyFixed" style="display:none">
+                <div class="icon">🔧</div>
+                <h3>No fixes yet</h3>
+                <p>Approved fixes will appear here after PRs are created.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const MUNINN_API = 'http://localhost:8500';  // Muninn service
+        const HUGINN_API = 'http://localhost:8400';  // Huginn service
+        const FORSETI_API = 'http://localhost:8600'; // Forseti service
+
+        // ── Tab switching ──
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('content' + capitalize(tab.dataset.tab)).classList.add('active');
+            });
+        });
+        function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+        // ── Fetch config ──
+        async function fetchConfig() {
+            try {
+                const res = await fetch(`${MUNINN_API}/api/config`);
+                const cfg = await res.json();
+                document.getElementById('cfgAgent').textContent = cfg.code_agent_provider || 'none';
+                document.getElementById('cfgLLM').textContent = `${cfg.llm_provider} (${cfg.gemini_model})`;
+                document.getElementById('cfgTemp').textContent = parseFloat(cfg.llm_temperature).toFixed(1);
+                document.getElementById('cfgTokens').textContent = cfg.llm_max_tokens;
+                document.getElementById('cfgRepos').textContent = (cfg.watched_repos || []).join(', ') || 'none';
+                document.getElementById('cfgPoll').textContent = `${cfg.poll_interval_secs}s`;
+
+                const badge = document.getElementById('modeBadge');
+                if (cfg.fix_mode === 'auto') {
+                    badge.textContent = '🤖 Auto Mode';
+                    badge.className = 'badge badge-auto';
+                } else {
+                    badge.textContent = '👁️ Review Mode';
+                    badge.className = 'badge badge-review';
+                }
+            } catch (e) {
+                console.error('Config fetch failed:', e);
+            }
+        }
+
+        // ── Fetch issues ──
+        async function fetchIssues() {
+            try {
+                const res = await fetch(`${MUNINN_API}/api/issues`);
+                const issues = await res.json();
+                renderAllIssues(issues);
+                renderReviewIssues(issues.filter(i => i.status === 'review_pending'));
+                renderFixedIssues(issues.filter(i => i.status === 'fixed'));
+                updateStats(issues);
+            } catch (e) {
+                console.error('Issues fetch failed:', e);
+            }
+        }
+
+        // ── Stats ──
+        function updateStats(issues) {
+            document.getElementById('statTotal').textContent = issues.length;
+            document.getElementById('statReview').textContent = issues.filter(i => i.status === 'review_pending').length;
+            document.getElementById('statFixed').textContent = issues.filter(i => i.status === 'fixed').length;
+            document.getElementById('statFailed').textContent = issues.filter(i => i.status === 'failed').length;
+            document.getElementById('statPending').textContent = issues.filter(i => ['pending', 'analyzing'].includes(i.status)).length;
+            document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+            // Update tab counts
+            document.getElementById('tabReview').textContent = `👁️ Pending Review (${issues.filter(i => i.status === 'review_pending').length})`;
+        }
+
+        // ── Render All Issues ──
+        function renderAllIssues(issues) {
+            const tbody = document.getElementById('allIssuesBody');
+            const empty = document.getElementById('emptyAll');
+            if (issues.length === 0) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+            empty.style.display = 'none';
+            tbody.innerHTML = issues.map(i => `
+                <tr>
+                    <td><strong>${i.repo.split('/')[1] || i.repo}</strong></td>
+                    <td><a href="https://github.com/${i.repo}/issues/${i.issue_number}" target="_blank">#${i.issue_number}</a></td>
+                    <td>${escapeHtml(i.title)}</td>
+                    <td><span class="priority-${i.priority}">${i.priority.toUpperCase()}</span></td>
+                    <td><span class="status-badge status-${i.status}">${formatStatus(i.status)}</span></td>
+                    <td>${timeAgo(i.updated_at)}</td>
+                    <td>${renderActions(i)}</td>
+                </tr>
+            `).join('');
+        }
+
+        // ── Render Review Issues ──
+        function renderReviewIssues(issues) {
+            const container = document.getElementById('reviewList');
+            const empty = document.getElementById('emptyReview');
+            if (issues.length === 0) { container.innerHTML = ''; empty.style.display = 'block'; return; }
+            empty.style.display = 'none';
+            container.innerHTML = issues.map(i => `
+                <div class="review-panel" id="review-${i.id}">
+                    <div class="review-header">
+                        <h3>🔍 ${escapeHtml(i.title)}</h3>
+                        <div>
+                            <span class="priority-${i.priority}">${i.priority.toUpperCase()}</span>
+                            &nbsp;·&nbsp;
+                            <a href="https://github.com/${i.repo}/issues/${i.issue_number}" target="_blank">${i.repo}#${i.issue_number}</a>
+                        </div>
+                    </div>
+                    <div class="review-body">
+                        ${i.fix_analysis ? `
+                        <div class="review-analysis">
+                            <h4>🧠 AI Analysis</h4>
+                            <p>${escapeHtml(i.fix_analysis)}</p>
+                        </div>` : ''}
+                        ${i.fix_diff ? `
+                        <h4 style="margin-bottom:0.5rem;font-size:0.9rem;">📝 Proposed Fix</h4>
+                        <div class="diff-view">${renderDiff(i.fix_diff)}</div>` : '<p style="color:var(--text-muted)">Fix diff not yet generated</p>'}
+                        <div class="review-actions">
+                            <button class="btn btn-reject" onclick="rejectFix('${i.id}')">❌ Reject</button>
+                            <button class="btn btn-approve" onclick="approveFix('${i.id}')">✅ Approve & Create PR</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // ── Render Fixed Issues ──
+        function renderFixedIssues(issues) {
+            const tbody = document.getElementById('fixedBody');
+            const empty = document.getElementById('emptyFixed');
+            if (issues.length === 0) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+            empty.style.display = 'none';
+            tbody.innerHTML = issues.map(i => `
+                <tr>
+                    <td><strong>${i.repo.split('/')[1] || i.repo}</strong></td>
+                    <td>#${i.issue_number}</td>
+                    <td>${escapeHtml(i.title)}</td>
+                    <td><span class="priority-${i.priority}">${i.priority.toUpperCase()}</span></td>
+                    <td>${i.fix_pr_url ? `<a href="${i.fix_pr_url}" target="_blank">View PR →</a>` : '—'}</td>
+                    <td>${timeAgo(i.updated_at)}</td>
+                </tr>
+            `).join('');
+        }
+
+        // ── Actions ──
+        async function approveFix(id) {
+            if (!confirm('Approve this fix and create a Draft PR?')) return;
+            try {
+                const res = await fetch(`${MUNINN_API}/api/issues/${id}/approve`, { method: 'POST' });
+                const data = await res.json();
+                alert(data.message || 'Fix approved!');
+                fetchIssues();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function rejectFix(id) {
+            if (!confirm('Reject this fix? The issue will be marked as skipped.')) return;
+            try {
+                const res = await fetch(`${MUNINN_API}/api/issues/${id}/reject`, { method: 'POST' });
+                const data = await res.json();
+                alert(data.message || 'Fix rejected.');
+                fetchIssues();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        function renderActions(issue) {
+            if (issue.status === 'review_pending') {
+                return `<button class="btn btn-approve" style="padding:0.3rem 0.8rem;font-size:0.75rem" onclick="approveFix('${issue.id}')">✅</button>
+                        <button class="btn btn-reject" style="padding:0.3rem 0.8rem;font-size:0.75rem" onclick="rejectFix('${issue.id}')">❌</button>`;
+            }
+            if (issue.fix_pr_url) {
+                return `<a href="${issue.fix_pr_url}" target="_blank" class="btn btn-secondary" style="padding:0.3rem 0.8rem;font-size:0.75rem;text-decoration:none">PR →</a>`;
+            }
+            return '';
+        }
+
+        // ── Helpers ──
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str || '';
+            return div.innerHTML;
+        }
+
+        function formatStatus(s) {
+            const map = { pending: '🔵 Pending', analyzing: '🔄 Analyzing', analyzed: '📋 Analyzed',
+                review_pending: '👁️ Review', fixing: '🔧 Fixing', fixed: '✅ Fixed',
+                skipped: '⏭️ Skipped', failed: '❌ Failed' };
+            return map[s] || s;
+        }
+
+        function timeAgo(dateStr) {
+            if (!dateStr) return '—';
+            const date = new Date(dateStr);
+            const now = new Date();
+            const diff = Math.floor((now - date) / 1000);
+            if (diff < 60) return 'just now';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+        }
+
+        function renderDiff(diff) {
+            if (!diff) return '';
+            return diff.split('\n').map(line => {
+                if (line.startsWith('+')) return `<span class="diff-add">${escapeHtml(line)}</span>`;
+                if (line.startsWith('-')) return `<span class="diff-remove">${escapeHtml(line)}</span>`;
+                return escapeHtml(line);
+            }).join('\n');
+        }
+
+        // ── Init ──
+        fetchConfig();
+        fetchIssues();
+        // Auto-refresh every 30s
+        setInterval(() => { fetchConfig(); fetchIssues(); }, 30000);
+    </script>
+</body>
+</html>
