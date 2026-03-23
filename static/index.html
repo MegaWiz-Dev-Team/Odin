@@ -349,6 +349,10 @@
     </div>
 
     <div class="stats-grid" id="statsGrid">
+        <div class="stat-card" id="postureCard" style="background: var(--mint-light); border: 2px solid var(--mint); padding: 1.25rem;">
+            <div class="stat-value" id="statPosture" style="color: var(--mint-dark); font-size: 2.5rem; letter-spacing: -2px;">100</div>
+            <div class="stat-label" style="color: var(--mint-dark); font-weight: 700; text-transform: uppercase; font-size: 0.75rem; margin-top: 0.5rem; letter-spacing: 0.05em;">Security Posture</div>
+        </div>
         <div class="stat-card"><div class="stat-value" id="statTotal">—</div><div class="stat-label">Total Issues</div></div>
         <div class="stat-card warning"><div class="stat-value" id="statReview">—</div><div class="stat-label">Pending Review</div></div>
         <div class="stat-card"><div class="stat-value" id="statFixed">—</div><div class="stat-label">Fixed</div></div>
@@ -461,6 +465,36 @@
         const FORSETI_API = SERVICES.find(s => s.name === 'Forseti').url;
         const MJOLNIR_API = SERVICES.find(s => s.name === 'Mjölnir').url;
 
+        // ── Posture Score State ──
+        let penaltyIssues = 0;
+        let penaltyServices = 0;
+        let penaltyLoad = 0;
+
+        function renderPostureScore() {
+            const score = Math.max(0, 100 - penaltyIssues - penaltyServices - penaltyLoad);
+            const el = document.getElementById('statPosture');
+            const card = document.getElementById('postureCard');
+            if (!el || !card) return;
+            el.textContent = score;
+
+            if (score >= 90) {
+                card.style.background = 'var(--mint-light)';
+                card.style.borderColor = 'var(--mint)';
+                el.style.color = 'var(--mint-dark)';
+                card.querySelector('.stat-label').style.color = 'var(--mint-dark)';
+            } else if (score >= 70) {
+                card.style.background = 'var(--warning-light)';
+                card.style.borderColor = 'var(--warning)';
+                el.style.color = 'var(--warning)';
+                card.querySelector('.stat-label').style.color = 'var(--warning)';
+            } else {
+                card.style.background = 'var(--danger-light)';
+                card.style.borderColor = 'var(--danger)';
+                el.style.color = 'var(--danger)';
+                card.querySelector('.stat-label').style.color = 'var(--danger)';
+            }
+        }
+
         // ── Tab switching ──
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
@@ -517,13 +551,21 @@
         // ── Stats ──
         function updateStats(issues) {
             document.getElementById('statTotal').textContent = issues.length;
-            document.getElementById('statReview').textContent = issues.filter(i => i.status === 'review_pending').length;
-            document.getElementById('statFixed').textContent = issues.filter(i => i.status === 'fixed').length;
-            document.getElementById('statFailed').textContent = issues.filter(i => i.status === 'failed').length;
-            document.getElementById('statPending').textContent = issues.filter(i => ['pending', 'analyzing'].includes(i.status)).length;
+            const reviewPending = issues.filter(i => i.status === 'review_pending').length;
+            const fixed = issues.filter(i => i.status === 'fixed').length;
+            const failed = issues.filter(i => i.status === 'failed').length;
+            const analyzing = issues.filter(i => ['pending', 'analyzing'].includes(i.status)).length;
+            
+            document.getElementById('statReview').textContent = reviewPending;
+            document.getElementById('statFixed').textContent = fixed;
+            document.getElementById('statFailed').textContent = failed;
+            document.getElementById('statPending').textContent = analyzing;
             document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
             // Update tab counts
-            document.getElementById('tabReview').textContent = `👁️ Pending Review (${issues.filter(i => i.status === 'review_pending').length})`;
+            document.getElementById('tabReview').textContent = `👁️ Pending Review (${reviewPending})`;
+
+            penaltyIssues = (failed * 10) + (reviewPending * 5) + (analyzing * 2);
+            renderPostureScore();
         }
 
         // ── Render All Issues ──
@@ -683,6 +725,7 @@
                 </div>`;
             }).join('');
 
+            let offlineCount = 0;
             await Promise.all(SERVICES.map(async s => {
                 const key = s.name.replace(/[^a-zA-Z]/g, '_');
                 const el = document.getElementById('svc_' + key);
@@ -690,11 +733,15 @@
                     const r = await fetch(s.url + s.healthPath, { signal: AbortSignal.timeout(3000) });
                     el.textContent = r.ok ? '✅ Online' : '⚠️ ' + r.status;
                     el.className = 'status-badge ' + (r.ok ? 'status-fixed' : 'status-analyzing');
+                    if (!r.ok) offlineCount++;
                 } catch {
                     el.textContent = '❌ Offline';
                     el.className = 'status-badge status-failed';
+                    offlineCount++;
                 }
             }));
+            penaltyServices = offlineCount * 10;
+            renderPostureScore();
         }
 
         // ── Load Tests ────────────────────────────────────────────────
@@ -702,6 +749,16 @@
             try {
                 const res = await fetch(`${MJOLNIR_API}/api/runs`);
                 const runs = await res.json();
+
+                let loadFailures = 0;
+                runs.forEach(r => {
+                    if (r.status === 'failed' || (r.result && r.result.error_rate_pct > 0)) {
+                        loadFailures++;
+                    }
+                });
+                penaltyLoad = loadFailures * 10;
+                renderPostureScore();
+
                 const tbody = document.getElementById('loadTestsBody');
                 const empty = document.getElementById('emptyLoadTests');
                 if (!runs.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
