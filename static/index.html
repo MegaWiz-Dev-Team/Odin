@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🏛️ Odin — Security Command Center</title>
-    <meta name="description" content="Odin Dashboard — Unified security pipeline for Huginn (scan), Muninn (fix), and Forseti (test)">
+    <meta name="description" content="Odin Dashboard — Unified command center: Huginn, Muninn, Forseti, Mjölnir, Mimir, Bifrost, Eir, Fenrir, Vardr, Heimdall, Ratatoskr">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -274,7 +274,7 @@
     <div class="header">
         <div>
             <h1><span>🏛️</span> Odin — Security Command Center</h1>
-            <div class="header-subtitle">Unified pipeline: Huginn (scan) → Muninn (fix) → Forseti (test)</div>
+            <div class="header-subtitle">Huginn · Muninn · Forseti · Mjölnir · Mimir · Bifrost · Eir · Fenrir · Vardr · Heimdall · Ratatoskr</div>
         </div>
         <div class="header-right">
             <span class="badge badge-review" id="modeBadge">👁️ Review Mode</span>
@@ -303,6 +303,8 @@
         <div class="tab active" data-tab="all" id="tabAll">📋 All Issues</div>
         <div class="tab" data-tab="review" id="tabReview">👁️ Pending Review</div>
         <div class="tab" data-tab="fixed" id="tabFixed">✅ Fixed</div>
+        <div class="tab" data-tab="loadtests" id="tabLoadtests">🔨 Load Tests</div>
+        <div class="tab" data-tab="services" id="tabServices">🔌 Services</div>
     </div>
 
     <div class="content">
@@ -353,12 +355,54 @@
                 <p>Approved fixes will appear here after PRs are created.</p>
             </div>
         </div>
+
+        <!-- Load Tests Tab -->
+        <div class="tab-content" id="contentLoadtests">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+                <h2 style="font-size:1rem;font-weight:600">🔨 Load Test Runs (Mjölnir)</h2>
+                <button class="btn btn-approve" onclick="triggerLoadTest()" style="padding:0.5rem 1.2rem;font-size:0.8rem">▶ Run New Test</button>
+            </div>
+            <table class="issues-table" id="loadTestsTable">
+                <thead><tr><th>Name</th><th>Status</th><th>RPS</th><th>P95</th><th>P99</th><th>Errors</th><th>Started</th></tr></thead>
+                <tbody id="loadTestsBody"></tbody>
+            </table>
+            <div class="empty-state" id="emptyLoadTests" style="display:none">
+                <div class="icon">🔨</div>
+                <h3>No load tests yet</h3>
+                <p>Click "Run New Test" to trigger a load test via Mjölnir.</p>
+            </div>
+        </div>
+
+        <!-- Services Tab -->
+        <div class="tab-content" id="contentServices">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin-top:0.5rem" id="servicesGrid"></div>
+        </div>
     </div>
 
     <script>
-        const MUNINN_API = 'http://localhost:8500';  // Muninn service
-        const HUGINN_API = 'http://localhost:8400';  // Huginn service
-        const FORSETI_API = 'http://localhost:8600'; // Forseti service
+        // ── Service Registry — all Asgard services ─────────────────
+        const SERVICES = [
+            { name: 'Mimir API',       emoji: '🧠', url: 'http://localhost:3000',  healthPath: '/api/health',  role: 'RAG / Application Layer' },
+            { name: 'Mimir Dashboard', emoji: '🖥️', url: 'http://localhost:3001',  healthPath: '/',            role: 'Mimir Web UI' },
+            { name: 'Bifrost',         emoji: '🌈', url: 'http://localhost:8100',  healthPath: '/healthz',     role: 'MCP Gateway / AI Router' },
+            { name: 'Fenrir',          emoji: '🐺', url: 'http://localhost:8200',  healthPath: '/healthz',     role: 'Platform Automation' },
+            { name: 'Eir Gateway',     emoji: '⚕️', url: 'http://localhost:8300',  healthPath: '/healthz',     role: 'Medical API Gateway' },
+            { name: 'Huginn',          emoji: '🦅', url: 'http://localhost:8400',  healthPath: '/health',      role: 'Security Scanner' },
+            { name: 'Muninn',          emoji: '🐦', url: 'http://localhost:8500',  healthPath: '/health',      role: 'Auto-Fixer Agent' },
+            { name: 'Forseti',         emoji: '⚖️', url: 'http://localhost:5555',  healthPath: '/',            role: 'E2E Test Dashboard' },
+            { name: 'Mjölnir',         emoji: '🔨', url: 'http://localhost:8700',  healthPath: '/healthz',     role: 'Load Testing Service' },
+            { name: 'Vardr',           emoji: '🛡️', url: 'http://localhost:9090',  healthPath: '/health',      role: 'System Monitor / Uptime' },
+            { name: 'Ratatoskr',       emoji: '🐿️', url: 'http://localhost:9200',  healthPath: '/healthz',     role: 'Browser Automation' },
+            { name: 'Heimdall',        emoji: '👁️', url: 'http://localhost:8080',  healthPath: '/health',      role: 'LLM Server (Ollama)' },
+            { name: 'Yggdrasil',       emoji: '🌳', url: 'http://localhost:8085',  healthPath: '/healthz',     role: 'Auth / Identity (Zitadel)' },
+            { name: 'Pageindex',       emoji: '📑', url: 'http://localhost:8600',  healthPath: '/health',      role: 'Page Indexing Sidecar' },
+        ];
+
+        // Shorthand refs
+        const MUNINN_API  = SERVICES.find(s => s.name === 'Muninn').url;
+        const HUGINN_API  = SERVICES.find(s => s.name === 'Huginn').url;
+        const FORSETI_API = SERVICES.find(s => s.name === 'Forseti').url;
+        const MJOLNIR_API = SERVICES.find(s => s.name === 'Mjölnir').url;
 
         // ── Tab switching ──
         document.querySelectorAll('.tab').forEach(tab => {
@@ -366,7 +410,10 @@
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
                 tab.classList.add('active');
-                document.getElementById('content' + capitalize(tab.dataset.tab)).classList.add('active');
+                const key = tab.dataset.tab;
+                document.getElementById('content' + key.charAt(0).toUpperCase() + key.slice(1)).classList.add('active');
+                if (key === 'services') fetchServices();
+                if (key === 'loadtests') fetchLoadTests();
             });
         });
         function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -559,10 +606,85 @@
             }).join('\n');
         }
 
+        // ── Services Health ──────────────────────────────────────────
+        async function fetchServices() {
+            const grid = document.getElementById('servicesGrid');
+            grid.innerHTML = SERVICES.map(s => {
+                const key = s.name.replace(/[^a-zA-Z]/g, '_');
+                return `<div class="stat-card" style="padding:1rem">
+                    <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
+                        <span style="font-size:1.5rem">${s.emoji}</span>
+                        <div>
+                            <div style="font-weight:600;font-size:0.88rem">${s.name}</div>
+                            <div style="font-size:0.7rem;color:var(--text-muted)">${s.role}</div>
+                        </div>
+                    </div>
+                    <div style="display:flex;align-items:center;justify-content:space-between">
+                        <a href="${s.url}" target="_blank" style="font-size:0.72rem;color:var(--text-muted);text-decoration:none">${s.url}</a>
+                        <span class="status-badge" id="svc_${key}">⏳</span>
+                    </div>
+                </div>`;
+            }).join('');
+
+            await Promise.all(SERVICES.map(async s => {
+                const key = s.name.replace(/[^a-zA-Z]/g, '_');
+                const el = document.getElementById('svc_' + key);
+                try {
+                    const r = await fetch(s.url + s.healthPath, { signal: AbortSignal.timeout(3000) });
+                    el.textContent = r.ok ? '✅ Online' : '⚠️ ' + r.status;
+                    el.className = 'status-badge ' + (r.ok ? 'status-fixed' : 'status-analyzing');
+                } catch {
+                    el.textContent = '❌ Offline';
+                    el.className = 'status-badge status-failed';
+                }
+            }));
+        }
+
+        // ── Load Tests ────────────────────────────────────────────────
+        async function fetchLoadTests() {
+            try {
+                const res = await fetch(`${MJOLNIR_API}/api/runs`);
+                const runs = await res.json();
+                const tbody = document.getElementById('loadTestsBody');
+                const empty = document.getElementById('emptyLoadTests');
+                if (!runs.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+                empty.style.display = 'none';
+                tbody.innerHTML = runs.map(r => {
+                    const m = r.result || {};
+                    return `<tr>
+                        <td><strong>${escapeHtml(r.name || '—')}</strong></td>
+                        <td><span class="status-badge ${r.status==='completed'?'status-fixed':r.status==='running'?'status-analyzing':'status-failed'}">${r.status}</span></td>
+                        <td>${m.rps_actual ?? '—'}</td>
+                        <td>${m.latency_p95_ms != null ? m.latency_p95_ms+'ms' : '—'}</td>
+                        <td>${m.latency_p99_ms != null ? m.latency_p99_ms+'ms' : '—'}</td>
+                        <td>${m.error_rate_pct != null ? m.error_rate_pct+'%' : '—'}</td>
+                        <td>${timeAgo(r.started_at)}</td>
+                    </tr>`;
+                }).join('');
+            } catch (e) { console.error('Mjölnir fetch failed:', e); }
+        }
+
+        async function triggerLoadTest() {
+            const url = prompt('Target URL to load test:', 'http://localhost:8300/healthz');
+            if (!url) return;
+            const workers = parseInt(prompt('Concurrent workers:', '20')) || 20;
+            const secs    = parseInt(prompt('Duration (seconds):', '30')) || 30;
+            const rps     = parseInt(prompt('Target RPS (0=unlimited):', '50')) || 0;
+            try {
+                const res = await fetch(`${MJOLNIR_API}/api/load/run`, {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({name:`Odin: ${url}`, target_url:url, workers, duration_secs:secs, rps, forseti_project:'odin'})
+                });
+                const data = await res.json();
+                alert(`✅ Load test started!\nRun ID: ${data.run_id}`);
+                fetchLoadTests();
+            } catch (e) { alert('❌ Failed: ' + e.message); }
+        }
+
         // ── Init ──
         fetchConfig();
         fetchIssues();
-        // Auto-refresh every 30s
         setInterval(() => { fetchConfig(); fetchIssues(); }, 30000);
     </script>
 </body>
