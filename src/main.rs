@@ -1,17 +1,24 @@
+mod agents;
+mod chat;
+
 use axum::{
     extract::Json,
     http::StatusCode,
     response::IntoResponse,
-    routing::{post, get_service},
+    routing::post,
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing::info;
+
+use crate::agents::AgentConfig;
+use crate::chat::ChatState;
 
 #[derive(Deserialize)]
 struct LoginRequest {
@@ -55,9 +62,16 @@ async fn main() {
     let static_dir = ServeDir::new("static")
         .not_found_service(ServeFile::new("static/index.html"));
 
+    // Shared state for chat (agent endpoint config from env)
+    let chat_state = ChatState {
+        cfg: Arc::new(AgentConfig::from_env()),
+    };
+
     // Build our application with routes
     let app = Router::new()
         .route("/api/auth/login", post(login))
+        .route("/api/chat", post(chat::chat_handler))
+        .with_state(chat_state)
         .fallback_service(static_dir)
         .layer(TraceLayer::new_for_http());
 

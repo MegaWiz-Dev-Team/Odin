@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Odin — Asgard Operator Chat</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #131a31;
+    --border: #1f2a4d;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #60a5fa;
+    --user: #1e3a8a;
+    --tool: #1f2937;
+    --tool-result: #064e3b;
+    --error: #7f1d1d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  header {
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+    background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .agents { font-size: 12px; color: var(--muted); }
+  header a { color: var(--muted); text-decoration: none; margin-left: auto; font-size: 13px; }
+  header a:hover { color: var(--accent); }
+  #log {
+    flex: 1; overflow-y: auto; padding: 16px 20px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .msg { padding: 10px 14px; border-radius: 8px; max-width: 85%;
+         white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; font-size: 14px; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.assistant { background: var(--panel); border: 1px solid var(--border); align-self: flex-start; }
+  .msg.tool-call { background: var(--tool); border-left: 3px solid var(--accent);
+                   align-self: flex-start; font-family: ui-monospace, monospace; font-size: 12px;
+                   color: var(--muted); }
+  .msg.tool-result { background: var(--tool-result); border-left: 3px solid #10b981;
+                     align-self: flex-start; font-family: ui-monospace, monospace; font-size: 11px;
+                     color: #d1fae5; padding: 6px 12px; white-space: normal; }
+  .msg.tool-result details { width: 100%; }
+  .msg.tool-result summary {
+    cursor: pointer; padding: 2px 0; user-select: none;
+    list-style: none; display: block;
+  }
+  .msg.tool-result summary::before { content: "▸ "; color: var(--accent); }
+  .msg.tool-result details[open] summary::before { content: "▾ "; }
+  .msg.tool-result summary::-webkit-details-marker { display: none; }
+  .msg.tool-result pre {
+    margin: 8px 0 0; max-height: 320px; overflow: auto;
+    background: rgba(0,0,0,0.25); padding: 8px; border-radius: 4px;
+    font-size: 11px;
+  }
+  .msg.error { background: var(--error); align-self: flex-start; font-size: 13px; }
+  .tool-name { color: var(--accent); font-weight: 600; }
+  details summary { cursor: pointer; }
+  form {
+    display: flex; gap: 8px; padding: 12px 20px;
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  textarea {
+    flex: 1; resize: none; padding: 10px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: #0f1428; color: var(--fg);
+    font: inherit; font-size: 14px; min-height: 38px; max-height: 120px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: 0 18px; border: none; border-radius: 6px;
+    background: var(--accent); color: #0b1020; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: var(--muted); cursor: not-allowed; }
+  .typing { color: var(--muted); font-style: italic; font-size: 12px; }
+  /* "Odin is thinking…" three-dot indicator while the model is reasoning
+     between events (initial wait, post-tool-call wait). */
+  .typing-indicator {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 12px 16px; min-height: 38px; max-width: 80px;
+  }
+  .typing-indicator .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted);
+    animation: typing-bounce 1.2s infinite ease-in-out both;
+  }
+  .typing-indicator .dot:nth-child(1) { animation-delay: 0s;    }
+  .typing-indicator .dot:nth-child(2) { animation-delay: 0.18s; }
+  .typing-indicator .dot:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes typing-bounce {
+    0%, 70%, 100% { transform: translateY(0);    opacity: 0.35; }
+    35%           { transform: translateY(-5px); opacity: 1;    }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦉 Odin</h1>
+  <div class="agents">Týr · Várðr · Huginn · Muninn · Forseti</div>
+  <a href="/">← Home</a>
+</header>
+<div id="log"></div>
+<form id="form">
+  <textarea id="input" placeholder="Ask about agents, alerts, scans, test runs… (Shift+Enter for newline)" autofocus></textarea>
+  <button id="send" type="submit">Send</button>
+</form>
+<script>
+const log = document.getElementById('log');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const history = [];
+
+function addMsg(cls, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+function addToolCall(name, args) {
+  const div = document.createElement('div');
+  div.className = 'msg tool-call';
+  div.innerHTML = '→ <span class="tool-name"></span> <span class="args"></span>';
+  div.querySelector('.tool-name').textContent = name;
+  const argsStr = Object.keys(args).length ? ' ' + JSON.stringify(args) : '';
+  div.querySelector('.args').textContent = argsStr;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// "Odin is thinking…" indicator. Single instance at a time — kept in
+// `typingEl`. Shown on form submit + after any tool_result while waiting
+// for the next streamed event. Removed as soon as a delta/tool_call/error
+// arrives so it doesn't sit next to actual content.
+let typingEl = null;
+function showTyping() {
+  if (typingEl) return; // already shown
+  typingEl = document.createElement('div');
+  typingEl.className = 'msg assistant typing-indicator';
+  typingEl.setAttribute('aria-label', 'Odin is thinking');
+  for (let i = 0; i < 3; i++) {
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    typingEl.appendChild(dot);
+  }
+  log.appendChild(typingEl);
+  log.scrollTop = log.scrollHeight;
+}
+function hideTyping() {
+  if (typingEl) { typingEl.remove(); typingEl = null; }
+}
+
+function addToolResult(name, result) {
+  const div = document.createElement('div');
+  div.className = 'msg tool-result';
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  // One-line preview helps when collapsed
+  let preview = '';
+  if (result && typeof result === 'object') {
+    if (result.error) preview = ' — error: ' + String(result.error).slice(0, 80);
+    else if (Array.isArray(result)) preview = ` — ${result.length} item${result.length===1?'':'s'}`;
+    else {
+      const keys = Object.keys(result);
+      preview = keys.length ? ` — ${keys.slice(0, 4).join(', ')}${keys.length>4?'…':''}` : '';
+    }
+  }
+  summary.textContent = name + preview;
+  details.appendChild(summary);
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(result, null, 2);
+  details.appendChild(pre);
+  div.appendChild(details);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    form.requestSubmit();
+  }
+});
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  addMsg('user', text);
+  history.push({ role: 'user', content: text });
+  input.value = '';
+  sendBtn.disabled = true;
+  showTyping();
+
+  let assistantBubble = null;
+  let assistantText = '';
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: history }),
+    });
+    if (!resp.ok || !resp.body) {
+      addMsg('error', 'HTTP ' + resp.status);
+      sendBtn.disabled = false;
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          let evt;
+          try { evt = JSON.parse(payload); } catch { continue; }
+          if (evt.type === 'delta') {
+            hideTyping();
+            if (!assistantBubble) assistantBubble = addMsg('assistant', '');
+            assistantText += evt.content;
+            assistantBubble.textContent = assistantText;
+            log.scrollTop = log.scrollHeight;
+          } else if (evt.type === 'tool_call') {
+            hideTyping();
+            addToolCall(evt.name, evt.args || {});
+            assistantBubble = null; assistantText = '';
+          } else if (evt.type === 'tool_result') {
+            addToolResult(evt.name, evt.result);
+            // Tool finished — Odin is now reasoning over the result before
+            // emitting the next delta or another tool_call. Re-show.
+            showTyping();
+          } else if (evt.type === 'error') {
+            hideTyping();
+            addMsg('error', evt.message);
+          } else if (evt.type === 'done') {
+            hideTyping();
+            if (assistantText) {
+              history.push({ role: 'assistant', content: assistantText });
+            } else {
+              // Model finished without producing a summary after tool calls.
+              // Show a marker so the user knows the turn ended.
+              const note = addMsg('assistant', '(no summary — see tool results above)');
+              note.style.opacity = '0.6';
+              note.style.fontSize = '12px';
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    addMsg('error', String(err));
+  } finally {
+    hideTyping();
+    sendBtn.disabled = false;
+    input.focus();
+  }
+});
+</script>
+</body>
+</html>
