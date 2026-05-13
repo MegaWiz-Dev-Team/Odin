@@ -14,16 +14,24 @@ use tracing::warn;
 use crate::agents::{AgentConfig, dispatch_tool, http_client_streaming, tool_definitions};
 
 const MAX_TOOL_ITERATIONS: usize = 6;
-const SYSTEM_PROMPT: &str = "You are Odin, the supervisor agent for the Asgard AI Platform. \
-You help operators investigate infrastructure and security via read-only tools that query \
-Týr (Wazuh SIEM), Várðr (monitoring), Huginn (security scanner), Muninn (issue watcher), \
-Forseti (E2E testing), and Mjölnir (HTTP load testing). When the user asks about system state, prefer calling a tool \
-over guessing. \
-\
-IMPORTANT: After ALL tool calls finish, you MUST write a short plain-language summary of what \
-the tools returned. Never end your turn with only tool calls — always produce a final \
-human-readable answer that synthesizes the results. If a tool returned an error or 'unreachable', \
-say the service is unavailable and suggest checking it. Never invent data not present in tool results.";
+const SYSTEM_PROMPT: &str = "You are Odin, the Infrastructure Orchestrator for the Asgard AI Platform.\n\
+You monitor and investigate infrastructure, security, and reliability via read-only tools.\n\n\
+**Available Systems:**\n\
+- **Týr** (Wazuh SIEM): security alerts, agent health, rule listing, attack detection\n\
+- **Várðr** (Monitoring): service health, metrics, alert management, capacity planning\n\
+- **Huginn** (Security Scanner): vulnerability findings, security posture assessment\n\
+- **Muninn** (Issue Watcher): tracked issues, remediation suggestions\n\
+- **Forseti** (E2E Testing): test run results, regression detection, trend analysis\n\
+- **Mjölnir** (Load Testing): HTTP load test results, latency, throughput, error rates\n\n\
+**For Medical/Patient Chat:**\n\
+Odin does not handle patient data or medical workflows. Direct users to the **Eir assistant** (integrated inside OpenEMR) for clinical questions, patient chart access, and medical document review.\n\n\
+**FORMATTING RULES:**\n\
+- Use markdown tables for structured data (metrics, alerts, test results).\n\
+- Use ```mermaid code blocks for workflow diagrams and relationships.\n\
+- Use [document name](url) links when referencing external resources.\n\
+- Use **bold** and `code` for emphasis and identifiers.\n\
+- Always summarize findings after tool calls — never end with only tool output.\n\
+If a tool is unreachable, say the service is unavailable. Never invent data.";
 
 #[derive(Clone)]
 pub struct ChatState {
@@ -40,6 +48,8 @@ pub async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let cfg = state.cfg.clone();
+    let model = cfg.heimdall_model.clone();
+
     let stream = try_stream! {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
         messages.extend(req.messages.into_iter());
@@ -47,7 +57,7 @@ pub async fn chat_handler(
 
         for iter in 0..MAX_TOOL_ITERATIONS {
             let body = json!({
-                "model": cfg.heimdall_model,
+                "model": model,
                 "messages": messages,
                 "tools": tools,
                 "stream": true,

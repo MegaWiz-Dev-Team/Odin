@@ -227,6 +227,27 @@ fn arg_str(args: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing arg: {}", key))
 }
 
+/// POST JSON to a URL, optionally setting X-Tenant-Id header.
+async fn json_post(client: &Client, url: &str, body: &Value, tenant_id: Option<&str>) -> Result<Value> {
+    let mut req = client.post(url).json(body);
+    if let Some(tid) = tenant_id {
+        req = req.header("X-Tenant-Id", tid);
+    }
+    let res = req.send().await;
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Ok(json!({ "error": format!("{}: {}", status, text), "url": url }));
+            }
+            Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text })))
+        }
+        Err(e) => Ok(json!({ "error": format!("unreachable: {}", e), "url": url })),
+    }
+}
+
+
 pub fn tool_definitions() -> Value {
     json!([
         // Týr — Wazuh SIEM
@@ -283,7 +304,7 @@ pub fn tool_definitions() -> Value {
 fn tool(name: &str, desc: &str, props: Value) -> Value {
     let required: Vec<String> = props
         .as_object()
-        .map(|o| o.keys().cloned().collect())
+        .map(|o| o.keys().filter(|k| *k != "session_id").cloned().collect())
         .unwrap_or_default();
     json!({
         "type": "function",

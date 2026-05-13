@@ -36,6 +36,7 @@ struct ErrorResponse {
     error: String,
 }
 
+
 async fn login(Json(payload): Json<LoginRequest>) -> impl IntoResponse {
     let user = payload.username.unwrap_or_default();
     let pass = payload.password.unwrap_or_default();
