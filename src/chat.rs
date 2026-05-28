@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::agents::{AgentConfig, dispatch_tool, http_client_streaming, tool_definitions};
+use crate::agents::{AgentConfig, dispatch_tool, http_client, http_client_streaming, tool_definitions};
 
 const MAX_TOOL_ITERATIONS: usize = 6;
 const SYSTEM_PROMPT: &str = "You are Odin, the Infrastructure Orchestrator for the Asgard AI Platform.\n\
@@ -32,6 +32,110 @@ Odin does not handle patient data or medical workflows. Direct users to the **Ei
 - Use **bold** and `code` for emphasis and identifiers.\n\
 - Always summarize findings after tool calls — never end with only tool output.\n\
 If a tool is unreachable, say the service is unavailable. Never invent data.";
+
+pub async fn run_agent(
+    cfg: &Arc<AgentConfig>,
+    messages: Vec<Value>,
+) -> anyhow::Result<(String, Vec<Value>)> {
+    let model = cfg.heimdall_model.clone();
+    let mut messages: Vec<Value> = {
+        let mut m = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+        m.extend(messages);
+        m
+    };
+    let tools = tool_definitions();
+
+    for _ in 0..MAX_TOOL_ITERATIONS {
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": false,
+            "temperature": 0.3,
+        });
+
+        let client = http_client();
+        let mut req_builder = client
+            .post(format!("{}/v1/chat/completions", cfg.heimdall_url))
+            .header("Content-Type", "application/json");
+        if let Some(k) = &cfg.heimdall_api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", k));
+        }
+        let resp = req_builder.json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Heimdall {}: {}", status, txt));
+        }
+
+        let resp_json: Value = resp.json().await?;
+        let choice = resp_json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .ok_or_else(|| anyhow::anyhow!("no choice in response"))?;
+
+        let assistant_text = choice
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let tool_calls = choice
+            .get("message")
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|fr| fr.as_str())
+            .unwrap_or("");
+
+        if tool_calls.is_empty() || finish_reason != "tool_calls" {
+            return Ok((assistant_text, messages));
+        }
+
+        let assistant_msg = json!({
+            "role": "assistant",
+            "content": if assistant_text.is_empty() { Value::Null } else { Value::String(assistant_text) },
+            "tool_calls": tool_calls,
+        });
+        messages.push(assistant_msg);
+
+        for call in tool_calls.iter() {
+            let id = call.get("id").and_then(|s| s.as_str()).unwrap_or("");
+            let name = call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args_str = call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}");
+
+            let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            let result = match dispatch_tool(cfg, name, &args).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("tool {} failed: {}", name, e);
+                    json!({ "error": e.to_string() })
+                }
+            };
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": result.to_string(),
+            }));
+        }
+    }
+
+    Err(anyhow::anyhow!("max tool iterations reached"))
+}
 
 #[derive(Clone)]
 pub struct ChatState {

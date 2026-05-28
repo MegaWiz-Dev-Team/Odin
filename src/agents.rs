@@ -20,6 +20,9 @@ pub struct AgentConfig {
     pub muninn_url: String,
     pub forseti_url: String,
     pub mjolnir_url: String,
+    pub discord_token: Option<String>,
+    pub discord_channel_id: String,
+    pub discord_webhook_url: Option<String>,
 }
 
 impl AgentConfig {
@@ -48,6 +51,9 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://forseti.asgard.svc.cluster.local:5555".into()),
             mjolnir_url: env::var("MJOLNIR_URL")
                 .unwrap_or_else(|_| "http://mjolnir.asgard.svc.cluster.local:8700".into()),
+            discord_token: env::var("DISCORD_TOKEN").ok(),
+            discord_channel_id: env::var("DISCORD_CHANNEL_ID").unwrap_or_default(),
+            discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
         }
     }
 }
@@ -95,6 +101,30 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             json_get(&client, &format!("{}/api/scans/{}/findings", cfg.huginn_url, id)).await
         }
         "huginn_stats" => json_get(&client, &format!("{}/api/stats", cfg.huginn_url)).await,
+        "huginn_start_scan" => {
+            let target = arg_str(args, "target")?;
+            let scan_type = args.get("scan_type").and_then(|v| v.as_str()).unwrap_or("zap_baseline");
+            let project = args.get("project").and_then(|v| v.as_str());
+            let body = json!({
+                "target": target,
+                "scan_type": scan_type,
+                "project": project
+            });
+            json_post(&client, &format!("{}/api/scan", cfg.huginn_url), &body, None).await
+        }
+        "huginn_scan_status" => {
+            let id = arg_str(args, "scan_id")?;
+            json_get(&client, &format!("{}/api/scans/{}", cfg.huginn_url, id)).await
+        }
+        "huginn_batch_scan" => {
+            let profile = args.get("profile").and_then(|v| v.as_str()).unwrap_or("priority1");
+            let sprint = args.get("sprint").and_then(|v| v.as_str());
+            let body = json!({
+                "profile": profile,
+                "sprint": sprint
+            });
+            json_post(&client, &format!("{}/api/scan/batch", cfg.huginn_url), &body, None).await
+        }
 
         "muninn_health" => json_get(&client, &format!("{}/health", cfg.muninn_url)).await,
         "muninn_list_issues" => json_get(&client, &format!("{}/api/issues", cfg.muninn_url)).await,
@@ -272,6 +302,18 @@ pub fn tool_definitions() -> Value {
             "scan_id": { "type": "string", "description": "scan id from list_scans" }
         })),
         tool("huginn_stats", "Huginn: aggregate scanner stats", json!({})),
+        tool("huginn_start_scan", "Huginn: start a single VA scan (zap_baseline/zap_openapi/llm) on a target service", json!({
+            "target": { "type": "string", "description": "service URL to scan (e.g. http://mimir-api.asgard.svc:8080)" },
+            "scan_type": { "type": "string", "description": "scan type: zap_baseline (OWASP Top 10), zap_openapi (API spec), zap_full (aggressive), llm (LLM security probe)" },
+            "project": { "type": "string", "description": "optional project name for grouping scans" }
+        })),
+        tool("huginn_scan_status", "Huginn: get status and findings count for a running or completed scan", json!({
+            "scan_id": { "type": "string", "description": "scan id returned from start_scan" }
+        })),
+        tool("huginn_batch_scan", "Huginn: trigger batch VA scan across multiple services (nightly equivalent). Returns all scan IDs", json!({
+            "profile": { "type": "string", "description": "profile: all (17 services), priority1 (4 high-risk), priority2 (5 medium-risk), priority3 (6 low-risk)" },
+            "sprint": { "type": "string", "description": "optional sprint label for grouping findings" }
+        })),
 
         // Muninn — Issue Watcher / Auto-Fixer
         tool("muninn_health", "Muninn (Issue Watcher): service health", json!({})),
