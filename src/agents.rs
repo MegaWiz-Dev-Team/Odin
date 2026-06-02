@@ -243,7 +243,7 @@ async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value
     serde_json::from_str(&body).map_err(|e| anyhow!("tyr json parse: {}", e))
 }
 
-async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size: u64) -> Result<Value> {
+pub async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size: u64) -> Result<Value> {
     let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
     let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
     let url = format!("{}/wazuh-alerts-*/_search", cfg.tyr_indexer_url);
@@ -367,6 +367,105 @@ pub async fn dedup_record(client: &Client, cfg: &AgentConfig, fingerprint: &str,
         .json(&body)
         .send()
         .await;
+}
+
+/// Result of an issue-creation attempt. Shared shape for the HITL endpoint
+/// and the autonomous Týr bridge.
+pub struct IssueOutcome {
+    pub status: &'static str, // "created" | "duplicate" | "error"
+    pub issue_url: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub error: Option<String>,
+}
+
+/// Core issue creation: dedup → create on GitHub → record fingerprint.
+/// The single place an issue is actually filed; used by both `/api/issues/create`
+/// (human-confirmed) and the Týr alert→issue bridge (autonomous). Requires
+/// `cfg.github_token`; recurring identical (repo+title) findings are deduped.
+pub async fn create_issue_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    title: &str,
+    body: &str,
+    labels: &[&str],
+) -> IssueOutcome {
+    let fp = issue_fingerprint(repo, title);
+
+    if let Some(url) = dedup_lookup(client, cfg, &fp).await {
+        return IssueOutcome {
+            status: "duplicate",
+            issue_url: Some(url),
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: None,
+        };
+    }
+
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => {
+            return IssueOutcome {
+                status: "error",
+                issue_url: None,
+                fingerprint: fp,
+                repo: repo.to_string(),
+                error: Some("GITHUB_TOKEN not configured on Odin".into()),
+            }
+        }
+    };
+
+    let url = format!("{}/repos/{}/issues", cfg.github_api_url, repo);
+    let payload = json!({ "title": title, "body": body, "labels": labels });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .json(&payload)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                let issue_url = v
+                    .get("html_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                dedup_record(client, cfg, &fp, repo, title, &issue_url).await;
+                IssueOutcome {
+                    status: "created",
+                    issue_url: Some(issue_url),
+                    fingerprint: fp,
+                    repo: repo.to_string(),
+                    error: None,
+                }
+            } else {
+                IssueOutcome {
+                    status: "error",
+                    issue_url: None,
+                    fingerprint: fp,
+                    repo: repo.to_string(),
+                    error: Some(format!(
+                        "github rejected: {}",
+                        v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+                    )),
+                }
+            }
+        }
+        Err(e) => IssueOutcome {
+            status: "error",
+            issue_url: None,
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: Some(format!("github unreachable: {}", e)),
+        },
+    }
 }
 
 /// POST JSON to a URL, optionally setting X-Tenant-Id header.

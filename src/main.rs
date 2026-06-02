@@ -1,4 +1,5 @@
 mod agents;
+mod bridge;
 mod chat;
 mod discord;
 mod findings;
@@ -262,56 +263,32 @@ async fn create_issue(
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
 
-    let token = match &cfg.github_token {
-        Some(t) => t.clone(),
-        None => return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response(),
-    };
+    // Preserve the explicit 503 contract: no token → service unavailable (propose
+    // still works; create is blocked — safe default).
+    if cfg.github_token.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
+    }
     let repo = req.repo.clone().unwrap_or_else(|| {
         crate::agents::service_to_repo(req.service.as_deref().unwrap_or(""))
     });
-    let fp = crate::agents::issue_fingerprint(&repo, &req.title);
+    let body = req.body.clone().unwrap_or_default();
 
-    // Dedup: if already filed, return the existing issue instead of a duplicate.
-    if let Some(url) = crate::agents::dedup_lookup(&client, &cfg, &fp).await {
-        return Json(serde_json::json!({
-            "status": "duplicate", "issue_url": url, "repo": repo, "fingerprint": fp
-        })).into_response();
-    }
+    let outcome = crate::agents::create_issue_core(
+        &client, &cfg, &repo, &req.title, &body, &["odin", "auto-triage"],
+    ).await;
 
-    let url = format!("{}/repos/{}/issues", cfg.github_api_url, repo);
-    let payload = serde_json::json!({
-        "title": req.title,
-        "body": req.body.clone().unwrap_or_default(),
-        "labels": ["odin", "auto-triage"],
-    });
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "odin-orchestrator")
-        .json(&payload)
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) => {
-            let ok = r.status().is_success();
-            let v: serde_json::Value = r.json().await.unwrap_or_default();
-            if ok {
-                let issue_url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
-                crate::agents::dedup_record(&client, &cfg, &fp, &repo, &req.title, issue_url).await;
-                Json(serde_json::json!({
-                    "status": "created", "issue_url": issue_url, "repo": repo, "fingerprint": fp
-                })).into_response()
-            } else {
-                (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                    "error": "github rejected", "detail": v.get("message"), "repo": repo
-                }))).into_response()
-            }
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("github unreachable: {}", e)}))).into_response(),
+    match outcome.status {
+        "created" | "duplicate" => Json(serde_json::json!({
+            "status": outcome.status,
+            "issue_url": outcome.issue_url,
+            "repo": outcome.repo,
+            "fingerprint": outcome.fingerprint,
+        })).into_response(),
+        _ => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": outcome.error.unwrap_or_else(|| "github error".into()),
+            "repo": outcome.repo,
+        }))).into_response(),
     }
 }
 
@@ -355,6 +332,12 @@ async fn main() {
     let discord_cfg = cfg.clone();
     tokio::spawn(async move {
         discord::start_bot(discord_cfg).await;
+    });
+
+    // Spawn Týr alert→issue bridge (no-op unless TYR_AUTO_BRIDGE=true)
+    let bridge_cfg = cfg.clone();
+    tokio::spawn(async move {
+        bridge::start_alert_bridge(bridge_cfg).await;
     });
 
     // Run our app
