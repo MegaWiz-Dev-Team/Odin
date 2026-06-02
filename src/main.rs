@@ -137,6 +137,8 @@ async fn health_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     let forseti = probe(format!("{}/api/runs?limit=1", cfg.forseti_url)).await;
     let mjolnir = probe(format!("{}/healthz",  cfg.mjolnir_url)).await;
     let loki    = probe(format!("{}/health",   cfg.loki_url)).await;
+    let ratatoskr = probe(format!("{}/healthz", cfg.ratatoskr_url)).await;
+    let laminar   = probe(format!("{}/health",  cfg.laminar_url)).await;
 
     Json(serde_json::json!({
         "odin": true,
@@ -149,6 +151,8 @@ async fn health_proxy(State(state): State<ChatState>) -> impl IntoResponse {
         "forseti": forseti,
         "mjolnir": mjolnir,
         "loki": loki,
+        "ratatoskr": ratatoskr,
+        "laminar": laminar,
     }))
 }
 

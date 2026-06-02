@@ -21,6 +21,8 @@ pub struct AgentConfig {
     pub forseti_url: String,
     pub mjolnir_url: String,
     pub loki_url: String,
+    pub ratatoskr_url: String,
+    pub laminar_url: String,
     pub discord_token: Option<String>,
     pub discord_channel_id: String,
     pub discord_webhook_url: Option<String>,
@@ -54,6 +56,10 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://mjolnir.asgard.svc.cluster.local:8700".into()),
             loki_url: env::var("LOKI_URL")
                 .unwrap_or_else(|_| "http://loki-api.asgard.svc.cluster.local:8000".into()),
+            ratatoskr_url: env::var("RATATOSKR_URL")
+                .unwrap_or_else(|_| "http://ratatoskr.asgard.svc.cluster.local:9200".into()),
+            laminar_url: env::var("LAMINAR_URL")
+                .unwrap_or_else(|_| "http://laminar-app-server.asgard.svc.cluster.local:8000".into()),
             discord_token: env::var("DISCORD_TOKEN").ok(),
             discord_channel_id: env::var("DISCORD_CHANNEL_ID").unwrap_or_default(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
@@ -162,6 +168,10 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             json_get(&client, &format!("{}/api/v1/loki/results?limit={}", cfg.loki_url, limit)).await
         }
         "loki_stats" => json_get(&client, &format!("{}/api/v1/loki/results/stats", cfg.loki_url)).await,
+
+        // Ratatoskr — shared headless browser service (health only; scrape/screenshot
+        // are write-actions reserved for a future Thor-gated tier)
+        "ratatoskr_health" => json_get(&client, &format!("{}/healthz", cfg.ratatoskr_url)).await,
 
         _ => Err(anyhow!("unknown tool: {}", name)),
     }
@@ -356,6 +366,9 @@ pub fn tool_definitions() -> Value {
             "limit": { "type": "integer", "description": "max results, default 50, max 200" }
         })),
         tool("loki_stats", "Loki: aggregate pen-test stats — counts by severity and by test_type, plus recent tests", json!({})),
+
+        // Ratatoskr — shared headless browser service
+        tool("ratatoskr_health", "Ratatoskr (shared headless browser): service health + session pool status", json!({})),
     ])
 }
 
