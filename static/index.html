@@ -344,6 +344,12 @@
         .oc-msg th, .oc-msg td { border:1px solid var(--border); padding:.3rem .5rem; text-align:left; }
         .oc-msg code { background:var(--surface-hover); padding:.1rem .35rem; border-radius:4px; font-size:.85em; }
         .oc-tool { font-family:ui-monospace,monospace; font-size:.76rem; color:var(--mint-dark); background:var(--mint-light); border-left:3px solid var(--mint); padding:.45rem .7rem; margin:.5rem 0; border-radius:4px; }
+        .oc-issue-card { border:1px solid var(--mint); border-radius:8px; padding:.6rem .8rem; margin:.5rem 0; background:var(--mint-light); font-size:.84rem; }
+        .oc-issue-h { color:var(--mint-dark); font-size:.74rem; margin-bottom:.2rem; }
+        .oc-issue-t { font-weight:600; margin-bottom:.4rem; }
+        .oc-issue-btn { padding:.3rem .8rem; background:var(--mint); color:#fff; border:none; border-radius:6px; font-size:.78rem; cursor:pointer; font-weight:700; }
+        .oc-issue-btn:disabled { opacity:.5; }
+        .oc-issue-status { font-size:.76rem; }
         .oc-err { color:var(--danger); font-size:.85rem; }
         .oc-foot { padding:.8rem; border-top:1px solid var(--border); display:flex; gap:.6rem; background:var(--surface); }
         .oc-foot input { flex:1; padding:.7rem .9rem; border:1px solid var(--border); border-radius:10px; font-size:.92rem; font-family:inherit; }
@@ -1008,6 +1014,41 @@
             d.innerHTML = '<div class="r">' + role + '</div><div class="b">' + (text ? marked.parse(text) : '') + '</div>';
             ocMsgs.appendChild(d); ocMsgs.scrollTop = ocMsgs.scrollHeight; return d;
         }
+        // Render an HITL confirm card for a proposed GitHub issue.
+        function odinIssueCard(r){
+            const d = document.createElement('div');
+            d.className = 'oc-issue-card';
+            if (r.duplicate_of) {
+                d.innerHTML = '\u26a0\ufe0f Already filed: <a href="'+r.duplicate_of+'" target="_blank">'+r.duplicate_of+'</a>';
+                return d;
+            }
+            const safe = (x)=> (x||'').replace(/</g,'&lt;');
+            d.innerHTML =
+                '<div class="oc-issue-h">\ud83d\udcdd Proposed issue \u2192 <code>'+safe(r.repo)+'</code></div>'+
+                '<div class="oc-issue-t">'+safe(r.title)+'</div>'+
+                '<button class="oc-issue-btn">Create issue</button> '+
+                '<span class="oc-issue-status"></span>';
+            const btn = d.querySelector('.oc-issue-btn');
+            const st = d.querySelector('.oc-issue-status');
+            btn.onclick = async () => {
+                btn.disabled = true; st.textContent = ' creating\u2026';
+                try {
+                    const res = await fetch('/api/issues/create', {
+                        method:'POST',
+                        headers: odinAuthHeaders({'Content-Type':'application/json'}),
+                        body: JSON.stringify({ repo: r.repo, title: r.title, body: r.body || '' })
+                    });
+                    const j = await res.json();
+                    if (j.issue_url) {
+                        st.innerHTML = (j.status==='duplicate'?' \u26a0\ufe0f exists: ':' \u2705 ')+'<a href="'+j.issue_url+'" target="_blank">'+j.issue_url+'</a>';
+                    } else {
+                        st.innerHTML = ' \u274c '+(j.error||'failed'); btn.disabled=false;
+                    }
+                } catch(e){ st.textContent=' \u274c '+e.message; btn.disabled=false; }
+            };
+            return d;
+        }
+
         async function odinSend(){
             if(ocBusy) return;
             const input = document.getElementById('ocInput'), text = input.value.trim();
@@ -1031,6 +1072,7 @@
                             let ev; try { ev = JSON.parse(payload); } catch { continue; }
                             if(ev.type==='delta'){ acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='tool_call'){ const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_result' && ev.name==='propose_github_issue' && ev.result){ asst.appendChild(odinIssueCard(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='error'){ body.innerHTML += '<div class="oc-err">'+ev.message+'</div>'; }
                         }
                     }

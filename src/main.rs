@@ -194,6 +194,77 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct CreateIssueRequest {
+    service: Option<String>,
+    repo: Option<String>,        // explicit owner/repo overrides service mapping
+    title: String,
+    body: Option<String>,
+}
+
+/// HITL confirm endpoint — the human clicked "Create" on a proposed issue.
+/// Dedups, creates the GitHub issue server-side (token never reaches the browser),
+/// records the fingerprint, and audits. This is the only place an issue is created.
+async fn create_issue(
+    State(state): State<ChatState>,
+    Json(req): Json<CreateIssueRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response(),
+    };
+    let repo = req.repo.clone().unwrap_or_else(|| {
+        crate::agents::service_to_repo(req.service.as_deref().unwrap_or(""))
+    });
+    let fp = crate::agents::issue_fingerprint(&repo, &req.title);
+
+    // Dedup: if already filed, return the existing issue instead of a duplicate.
+    if let Some(url) = crate::agents::dedup_lookup(&client, &cfg, &fp).await {
+        return Json(serde_json::json!({
+            "status": "duplicate", "issue_url": url, "repo": repo, "fingerprint": fp
+        })).into_response();
+    }
+
+    let url = format!("{}/repos/{}/issues", cfg.github_api_url, repo);
+    let payload = serde_json::json!({
+        "title": req.title,
+        "body": req.body.clone().unwrap_or_default(),
+        "labels": ["odin", "auto-triage"],
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .json(&payload)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            if ok {
+                let issue_url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
+                crate::agents::dedup_record(&client, &cfg, &fp, &repo, &req.title, issue_url).await;
+                Json(serde_json::json!({
+                    "status": "created", "issue_url": issue_url, "repo": repo, "fingerprint": fp
+                })).into_response()
+            } else {
+                (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                    "error": "github rejected", "detail": v.get("message"), "repo": repo
+                }))).into_response()
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("github unreachable: {}", e)}))).into_response(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -214,6 +285,7 @@ async fn main() {
         .route("/api/chat", post(chat::chat_handler))
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
+        .route("/api/issues/create", post(create_issue))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));
 

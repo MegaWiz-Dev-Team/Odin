@@ -23,6 +23,8 @@ pub struct AgentConfig {
     pub loki_url: String,
     pub ratatoskr_url: String,
     pub laminar_url: String,
+    pub github_token: Option<String>,
+    pub github_api_url: String,
     pub discord_token: Option<String>,
     pub discord_channel_id: String,
     pub discord_webhook_url: Option<String>,
@@ -60,6 +62,9 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://ratatoskr.asgard.svc.cluster.local:9200".into()),
             laminar_url: env::var("LAMINAR_URL")
                 .unwrap_or_else(|_| "http://laminar-app-server.asgard.svc.cluster.local:8000".into()),
+            github_token: env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()),
+            github_api_url: env::var("GITHUB_API_URL")
+                .unwrap_or_else(|_| "https://api.github.com".into()),
             discord_token: env::var("DISCORD_TOKEN").ok(),
             discord_channel_id: env::var("DISCORD_CHANNEL_ID").unwrap_or_default(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
@@ -173,6 +178,28 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
         // are write-actions reserved for a future Thor-gated tier)
         "ratatoskr_health" => json_get(&client, &format!("{}/healthz", cfg.ratatoskr_url)).await,
 
+        // propose_github_issue — READ-ONLY: resolves repo, runs dedup check, returns a
+        // proposal for the human to confirm. Does NOT create the issue (HITL).
+        // Actual creation happens via the POST /api/issues/create endpoint after a click.
+        "propose_github_issue" => {
+            let service = arg_str(args, "service").unwrap_or_default();
+            let title = arg_str(args, "title")?;
+            let repo = service_to_repo(&service);
+            let fp = issue_fingerprint(&repo, &title);
+            // dedup lookup in the odin-issue-dedup index (Odin has indexer creds)
+            let existing = dedup_lookup(&client, cfg, &fp).await;
+            Ok(json!({
+                "action": "propose_github_issue",
+                "repo": repo,
+                "title": title,
+                "body": args.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+                "fingerprint": fp,
+                "duplicate_of": existing,   // url if already filed, else null
+                "needs_confirmation": true,
+                "note": "Proposal only — confirm in the UI to create. Will be skipped if duplicate_of is set."
+            }))
+        }
+
         _ => Err(anyhow!("unknown tool: {}", name)),
     }
 }
@@ -277,6 +304,71 @@ fn arg_str(args: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing arg: {}", key))
 }
 
+/// Map a scanned/alerting service name → real GitHub `owner/repo`.
+/// Mirrors Huginn's mapping so Odin and Huginn file to the same place.
+pub fn service_to_repo(service: &str) -> String {
+    const ORG: &str = "MegaWiz-Dev-Team";
+    let repo = match service.to_lowercase().as_str() {
+        "mimir-api" | "mimir-dashboard" | "mimir" => "Mimir",
+        "syn-api" | "syn" => "Syn",
+        "eir-gateway" | "eir" => "Eir",
+        "bifrost" => "Bifrost",
+        "heimdall" | "heimdall-host" => "Heimdall",
+        "huginn" => "Huginn",
+        "muninn" => "Muninn",
+        "odin" => "Odin",
+        "loki" | "loki-api" => "Loki",
+        "tyr" | "wazuh-manager" | "wazuh-indexer" => "Tyr",
+        "vardr" => "Vardr",
+        "forseti" => "Forseti",
+        "mjolnir" => "Mjolnir",
+        "ratatoskr" => "Ratatoskr",
+        "yggdrasil" => "Yggdrasil",
+        "hermodr" => "Hermodr",
+        _ => "Asgard",
+    };
+    format!("{}/{}", ORG, repo)
+}
+
+/// Stable fingerprint for an issue = deterministic hash of repo+title.
+/// Used to dedup so the same finding/alert doesn't open duplicate issues.
+pub fn issue_fingerprint(repo: &str, title: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut h);
+    title.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Look up an existing issue by fingerprint in the `odin-issue-dedup` index.
+/// Returns the issue URL if already filed (→ caller skips creation), else None.
+pub async fn dedup_lookup(client: &Client, cfg: &AgentConfig, fingerprint: &str) -> Option<String> {
+    let url = format!("{}/odin-issue-dedup/_doc/{}", cfg.tyr_indexer_url, fingerprint);
+    let r = client
+        .get(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None; // 404 = not seen before
+    }
+    let v: Value = r.json().await.ok()?;
+    v.pointer("/_source/issue_url").and_then(|u| u.as_str()).map(|s| s.to_string())
+}
+
+/// Record a created issue's fingerprint → url in the dedup index.
+pub async fn dedup_record(client: &Client, cfg: &AgentConfig, fingerprint: &str, repo: &str, title: &str, issue_url: &str) {
+    let url = format!("{}/odin-issue-dedup/_doc/{}", cfg.tyr_indexer_url, fingerprint);
+    let body = json!({ "repo": repo, "title": title, "issue_url": issue_url });
+    let _ = client
+        .put(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&body)
+        .send()
+        .await;
+}
+
 /// POST JSON to a URL, optionally setting X-Tenant-Id header.
 async fn json_post(client: &Client, url: &str, body: &Value, tenant_id: Option<&str>) -> Result<Value> {
     let mut req = client.post(url).json(body);
@@ -369,6 +461,15 @@ pub fn tool_definitions() -> Value {
 
         // Ratatoskr — shared headless browser service
         tool("ratatoskr_health", "Ratatoskr (shared headless browser): service health + session pool status", json!({})),
+
+        // propose_github_issue — staged write (T2). Returns a proposal for the human to
+        // confirm in the UI; does NOT create the issue itself. Use after triaging an
+        // alert/finding when the user asks to file/track it.
+        tool("propose_github_issue", "Propose a GitHub issue for a finding/alert (does NOT create it — returns a proposal the human confirms with a button). Auto-resolves the target repo from the service name and checks for duplicates.", json!({
+            "service": { "type": "string", "description": "service the issue is about, e.g. 'eir-gateway', 'mimir-api', 'tyr' — used to pick the repo" },
+            "title": { "type": "string", "description": "concise issue title" },
+            "body": { "type": "string", "description": "issue body in markdown (summary, evidence, remediation)" }
+        })),
     ])
 }
 
