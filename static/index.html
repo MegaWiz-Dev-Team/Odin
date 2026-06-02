@@ -6,6 +6,7 @@
     <title>🏛️ Odin — Security Command Center</title>
     <meta name="description" content="Odin Dashboard — Unified command center: Huginn, Muninn, Forseti, Mjölnir, Mimir, Bifrost, Eir, Fenrir, Vardr, Heimdall, Ratatoskr">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         :root {
             --bg: #f8fffe;
@@ -314,6 +315,41 @@
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .config-bar { flex-wrap: wrap; gap: 1rem; }
         }
+
+        /* Odin Chat Popup (FAB + panel) */
+        #odinFab { position:fixed; right:24px; bottom:24px; z-index:10000; width:60px; height:60px; border-radius:50%; background:linear-gradient(135deg,var(--mint-dark),var(--mint)); border:none; cursor:pointer; color:#fff; font-size:1.6rem; box-shadow:0 8px 28px rgba(16,185,129,.45); display:flex; align-items:center; justify-content:center; transition:transform .15s ease; }
+        #odinFab:hover { transform:scale(1.07); }
+        #odinFab.open { background:#334155; }
+        #odinChat { position:fixed; right:24px; bottom:100px; z-index:10000; width:520px; height:720px; min-width:340px; min-height:380px; max-width:calc(100vw - 32px); max-height:calc(100vh - 120px); background:var(--surface); border:1px solid var(--border); border-radius:16px; box-shadow:0 24px 60px rgba(0,0,0,.25); display:none; flex-direction:column; overflow:hidden; animation:odinPop .16s ease-out; }
+        #odinChat.maximized { width:calc(100vw - 48px) !important; height:calc(100vh - 48px) !important; right:24px; bottom:24px; }
+        #odinResize { position:absolute; top:0; left:0; width:18px; height:18px; cursor:nwse-resize; z-index:10001; }
+        #odinResize::before { content:''; position:absolute; top:5px; left:5px; width:8px; height:8px; border-top:2px solid var(--text-muted); border-left:2px solid var(--text-muted); border-radius:2px 0 0 0; opacity:.6; }
+        #odinChat.maximized #odinResize { display:none; }
+        #odinChat.open { display:flex; }
+        @keyframes odinPop { from{opacity:0;transform:scale(.94) translateY(8px);} to{opacity:1;transform:scale(1) translateY(0);} }
+        .oc-head { padding:.9rem 1.1rem; background:linear-gradient(135deg,var(--mint-dark),var(--mint)); color:#fff; display:flex; align-items:center; justify-content:space-between; }
+        .oc-head .t { font-weight:700; display:flex; gap:.5rem; align-items:center; }
+        .oc-head .t small { opacity:.8; font-weight:400; font-size:.72rem; }
+        .oc-head button { background:none; border:none; color:#fff; font-size:1.2rem; cursor:pointer; line-height:1; opacity:.85; }
+        .oc-head button:hover { opacity:1; }
+        .oc-msgs { flex:1; overflow-y:auto; padding:1rem; background:var(--bg); }
+        .oc-empty { color:var(--text-muted); font-size:.86rem; text-align:center; margin-top:1.5rem; line-height:1.7; }
+        .oc-chip { display:inline-block; background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:.4rem .8rem; margin:.25rem; cursor:pointer; color:var(--text); font-size:.8rem; }
+        .oc-chip:hover { border-color:var(--mint); color:var(--mint-dark); }
+        .oc-msg { margin-bottom:.85rem; padding:.7rem .9rem; border-radius:10px; line-height:1.55; font-size:.9rem; }
+        .oc-msg.user { background:var(--mint-light); color:var(--mint-dark); margin-left:1.5rem; }
+        .oc-msg.assistant { background:var(--surface); border:1px solid var(--border); margin-right:1rem; }
+        .oc-msg .r { font-size:.68rem; color:var(--text-muted); margin-bottom:.3rem; text-transform:uppercase; letter-spacing:.05em; }
+        .oc-msg table { border-collapse:collapse; margin:.5rem 0; font-size:.78rem; width:100%; }
+        .oc-msg th, .oc-msg td { border:1px solid var(--border); padding:.3rem .5rem; text-align:left; }
+        .oc-msg code { background:var(--surface-hover); padding:.1rem .35rem; border-radius:4px; font-size:.85em; }
+        .oc-tool { font-family:ui-monospace,monospace; font-size:.76rem; color:var(--mint-dark); background:var(--mint-light); border-left:3px solid var(--mint); padding:.45rem .7rem; margin:.5rem 0; border-radius:4px; }
+        .oc-err { color:var(--danger); font-size:.85rem; }
+        .oc-foot { padding:.8rem; border-top:1px solid var(--border); display:flex; gap:.6rem; background:var(--surface); }
+        .oc-foot input { flex:1; padding:.7rem .9rem; border:1px solid var(--border); border-radius:10px; font-size:.92rem; font-family:inherit; }
+        .oc-foot input:focus { outline:none; border-color:var(--mint); }
+        .oc-foot button { padding:.7rem 1.1rem; background:var(--mint); border:none; border-radius:10px; color:#fff; font-weight:700; cursor:pointer; }
+        .oc-foot button:disabled { opacity:.5; cursor:default; }
     </style>
 </head>
 <body>
@@ -333,7 +369,7 @@
             <div class="header-subtitle">Huginn · Muninn · Forseti · Mjölnir · Mimir · Bifrost · Eir · Fenrir · Vardr · Heimdall · Ratatoskr</div>
         </div>
         <div class="header-right">
-            <a href="/chat.html" class="badge badge-review" style="text-decoration:none;background:rgba(255,255,255,0.18);">💬 Chat</a>
+            <a href="#" class="badge badge-review" style="text-decoration:none;background:rgba(255,255,255,0.18);" onclick="odinToggleChat();return false;">💬 Ask Odin</a>
             <span class="badge badge-review" id="modeBadge">👁️ Review Mode</span>
             <span id="lastUpdate" style="font-size:0.75rem;opacity:0.7"></span>
             <button class="btn btn-secondary" style="padding:0.4rem 0.8rem;font-size:0.75rem;border-color:transparent;background:rgba(255,255,255,0.1);color:white;" onclick="logout()">Logout</button>
@@ -372,6 +408,15 @@
     <div class="content">
         <!-- All Issues Tab -->
         <div class="tab-content active" id="contentAll">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+                <div style="font-size:0.8rem;color:var(--text-muted)" id="issuesUpdated">—</div>
+                <div style="display:flex;gap:0.6rem;align-items:center">
+                    <label style="font-size:0.78rem;color:var(--text-muted);display:flex;align-items:center;gap:0.3rem;cursor:pointer">
+                        <input type="checkbox" id="autoRefresh" checked onchange="toggleAuto()"> Auto (10s)
+                    </label>
+                    <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">\u21bb Refresh</button>
+                </div>
+            </div>
             <table class="issues-table" id="allIssuesTable">
                 <thead>
                     <tr>
@@ -442,29 +487,43 @@
     </div>
 
     <script>
+        // Attach the bearer token (from login) to protected API calls.
+        function odinAuthHeaders(extra) {
+            const t = localStorage.getItem('odin_token');
+            const h = extra || {};
+            if (t) h['Authorization'] = 'Bearer ' + t;
+            return h;
+        }
+
         // ── Service Registry — all Asgard services ─────────────────
         const SERVICES = [
-            { name: 'Mimir API',       emoji: '🧠', url: 'http://localhost:3000',  healthPath: '/api/health',  role: 'RAG / Application Layer' },
-            { name: 'Mimir Dashboard', emoji: '🖥️', url: 'http://localhost:3001',  healthPath: '/',            role: 'Mimir Web UI' },
-            { name: 'Bifrost',         emoji: '🌈', url: 'http://localhost:8100',  healthPath: '/healthz',     role: 'MCP Gateway / AI Router' },
-            { name: 'Fenrir',          emoji: '🐺', url: 'http://localhost:8200',  healthPath: '/healthz',     role: 'Platform Automation' },
-            { name: 'Eir Gateway',     emoji: '⚕️', url: 'http://localhost:8300',  healthPath: '/healthz',     role: 'Medical API Gateway' },
-            { name: 'Huginn',          emoji: '🦅', url: 'http://localhost:8400',  healthPath: '/health',      role: 'Security Scanner' },
-            { name: 'Muninn',          emoji: '🐦', url: 'http://localhost:8500',  healthPath: '/health',      role: 'Auto-Fixer Agent' },
-            { name: 'Forseti',         emoji: '⚖️', url: 'http://localhost:5555',  healthPath: '/',            role: 'E2E Test Dashboard' },
-            { name: 'Mjölnir',         emoji: '🔨', url: 'http://localhost:8700',  healthPath: '/healthz',     role: 'Load Testing Service' },
-            { name: 'Vardr',           emoji: '🛡️', url: 'http://localhost:9090',  healthPath: '/health',      role: 'System Monitor / Uptime' },
-            { name: 'Ratatoskr',       emoji: '🐿️', url: 'http://localhost:9200',  healthPath: '/healthz',     role: 'Browser Automation' },
-            { name: 'Heimdall',        emoji: '👁️', url: 'http://localhost:8080',  healthPath: '/health',      role: 'LLM Server (Ollama)' },
-            { name: 'Yggdrasil',       emoji: '🌳', url: 'http://localhost:8085',  healthPath: '/healthz',     role: 'Auth / Identity (Zitadel)' },
-            { name: 'Pageindex',       emoji: '📑', url: 'http://localhost:8600',  healthPath: '/health',      role: 'Page Indexing Sidecar' },
+            // Host-reachable (live health-check works from the browser)
+            { name: 'Odin',            emoji: '🏛️', proxy: 'odin', role: 'Orchestrator (this UI)' },
+            { name: 'Heimdall',        emoji: '👁️', proxy: 'heimdall',     role: 'LLM Gateway (MLX, local)' },
+            { name: 'Tyr — Wazuh Indexer', emoji: '🛡️', proxy: 'tyr_indexer', role: 'SIEM alert store (OpenSearch)' },
+            { name: 'Tyr — Wazuh Manager',  emoji: '⚔️', proxy: 'tyr_manager', role: 'SIEM manager / agents / rules' },
+            // In-cluster (k8s ClusterIP — running, not exposed to the browser)
+            { name: 'Bifrost',   emoji: '🌈', cluster: true, role: 'MCP Gateway / AI Router' },
+            { name: 'Mimir API', emoji: '🧠', cluster: true, role: 'RAG / Knowledge base' },
+            { name: 'Syn',       emoji: '👁️', cluster: true, role: 'OCR / Extraction' },
+            { name: 'Eir',       emoji: '⚕️', cluster: true, role: 'Medical agent gateway' },
+            { name: 'Hermodr',   emoji: '📡', cluster: true, role: 'MCP tool bridge' },
+            { name: 'Huginn',    emoji: '🦅', proxy: 'huginn', role: 'Security Scanner' },
+            { name: 'Muninn',    emoji: '🐦', proxy: 'muninn', role: 'Auto-Fixer Agent' },
+            { name: 'Forseti',   emoji: '⚖️', proxy: 'forseti', role: 'E2E Testing' },
+            { name: 'Mjölnir',  emoji: '🔨', proxy: 'mjolnir', role: 'Load Testing' },
+            { name: 'Várðr',    emoji: '📊', proxy: 'vardr', role: 'Monitoring / Uptime' },
+            { name: 'Laminar',   emoji: '🔍', cluster: true, role: 'Tracing (heimdall-trace)' },
+            { name: 'Loki',      emoji: '👿', proxy: 'loki', role: 'Authorized pen-test (red team)' },
+            { name: 'Yggdrasil', emoji: '🌳', cluster: true, role: 'Auth / Identity (Zitadel)' },
         ];
 
         // Shorthand refs
-        const MUNINN_API  = SERVICES.find(s => s.name === 'Muninn').url;
-        const HUGINN_API  = SERVICES.find(s => s.name === 'Huginn').url;
-        const FORSETI_API = SERVICES.find(s => s.name === 'Forseti').url;
-        const MJOLNIR_API = SERVICES.find(s => s.name === 'Mjölnir').url;
+        const _find = n => (SERVICES.find(s => s.name === n) || {}).url || '';
+        const MUNINN_API  = _find('Muninn');
+        const HUGINN_API  = _find('Huginn');
+        const FORSETI_API = _find('Forseti');
+        const MJOLNIR_API = _find('Mjölnir');
 
         // ── Posture Score State ──
         let penaltyIssues = 0;
@@ -513,7 +572,7 @@
         // ── Fetch config ──
         async function fetchConfig() {
             try {
-                const res = await fetch(`${MUNINN_API}/api/config`);
+                const res = await fetch('/api/config', { headers: odinAuthHeaders() });
                 const cfg = await res.json();
                 document.getElementById('cfgAgent').textContent = cfg.code_agent_provider || 'none';
                 document.getElementById('cfgLLM').textContent = `${cfg.llm_provider} (${cfg.gemini_model})`;
@@ -538,7 +597,7 @@
         // ── Fetch issues ──
         async function fetchIssues() {
             try {
-                const res = await fetch(`${MUNINN_API}/api/issues`);
+                const res = await fetch('/api/issues', { headers: odinAuthHeaders() });
                 const issues = await res.json();
                 renderAllIssues(issues);
                 renderReviewIssues(issues.filter(i => i.status === 'review_pending'));
@@ -711,6 +770,16 @@
             const grid = document.getElementById('servicesGrid');
             grid.innerHTML = SERVICES.map(s => {
                 const key = s.name.replace(/[^a-zA-Z]/g, '_');
+                let locHtml;
+                if (s.cluster) {
+                    locHtml = `<span style="font-size:0.72rem;color:var(--text-muted)">k8s ClusterIP (internal)</span>`;
+                } else if (s.proxy) {
+                    locHtml = `<span style="font-size:0.72rem;color:var(--text-muted)">via Odin proxy</span>`;
+                } else if (s.url) {
+                    locHtml = `<a href="${s.url}" target="_blank" style="font-size:0.72rem;color:var(--text-muted);text-decoration:none">${s.url}</a>`;
+                } else {
+                    locHtml = '';
+                }
                 return `<div class="stat-card" style="padding:1rem">
                     <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
                         <span style="font-size:1.5rem">${s.emoji}</span>
@@ -720,21 +789,39 @@
                         </div>
                     </div>
                     <div style="display:flex;align-items:center;justify-content:space-between">
-                        <a href="${s.url}" target="_blank" style="font-size:0.72rem;color:var(--text-muted);text-decoration:none">${s.url}</a>
+                        ${locHtml}
                         <span class="status-badge" id="svc_${key}">⏳</span>
                     </div>
                 </div>`;
             }).join('');
 
             let offlineCount = 0;
+            let hp = {};
+            try { hp = await (await fetch('/api/health-proxy', { headers: odinAuthHeaders(), signal: AbortSignal.timeout(8000) })).json(); } catch {}
             await Promise.all(SERVICES.map(async s => {
                 const key = s.name.replace(/[^a-zA-Z]/g, '_');
                 const el = document.getElementById('svc_' + key);
+                if (!el) return;
+                if (s.cluster) {
+                    el.textContent = '☸️ In-cluster';
+                    el.className = 'status-badge';
+                    el.style.background = '#eef2f7'; el.style.color = '#64748b';
+                    return;
+                }
+                if (s.proxy) {
+                    const ok = !!hp[s.proxy];
+                    el.textContent = ok ? '✅ Online' : '❌ Offline';
+                    el.className = 'status-badge ' + (ok ? 'status-fixed' : 'status-failed');
+                    if (!ok) offlineCount++;
+                    return;
+                }
                 try {
-                    const r = await fetch(s.url + s.healthPath, { signal: AbortSignal.timeout(3000) });
-                    el.textContent = r.ok ? '✅ Online' : '⚠️ ' + r.status;
-                    el.className = 'status-badge ' + (r.ok ? 'status-fixed' : 'status-analyzing');
-                    if (!r.ok) offlineCount++;
+                    const r = await fetch(s.url + s.healthPath, { mode: s.insecure ? 'no-cors' : 'cors', signal: AbortSignal.timeout(3000) });
+                    // no-cors gives an opaque response (status 0) but a resolved fetch means the port answered
+                    const ok = r.ok || r.type === 'opaque';
+                    el.textContent = ok ? '✅ Online' : '⚠️ ' + r.status;
+                    el.className = 'status-badge ' + (ok ? 'status-fixed' : 'status-analyzing');
+                    if (!ok) offlineCount++;
                 } catch {
                     el.textContent = '❌ Offline';
                     el.className = 'status-badge status-failed';
@@ -822,18 +909,134 @@
             location.reload();
         }
 
+        // ── Manual refresh + issues auto-poll (10s) ──
+        let issuesPoll = null;
+        async function refreshNow(){
+            const btn = document.getElementById('refreshIssues');
+            if (btn) { btn.disabled = true; btn.textContent = '\u27f3 Refreshing…'; }
+            try { await fetchIssues(); } catch(e) {}
+            const u = document.getElementById('issuesUpdated');
+            if (u) u.textContent = 'Updated ' + new Date().toLocaleTimeString();
+            if (btn) { btn.disabled = false; btn.textContent = '\u21bb Refresh'; }
+        }
+        function toggleAuto(){
+            const on = document.getElementById('autoRefresh').checked;
+            if (issuesPoll) { clearInterval(issuesPoll); issuesPoll = null; }
+            if (on) issuesPoll = setInterval(refreshNow, 10000);
+        }
+
         let dashInterval;
         function initDashboard() {
             fetchConfig();
             fetchIssues();
             if (dashInterval) clearInterval(dashInterval);
             dashInterval = setInterval(() => { fetchConfig(); fetchIssues(); }, 30000);
+            toggleAuto();   // start the 10s issues auto-poll (checkbox defaults on)
+            const u = document.getElementById('issuesUpdated');
+            if (u) u.textContent = 'Updated ' + new Date().toLocaleTimeString();
         }
 
         if (!localStorage.getItem('odin_token')) {
             document.getElementById('loginOverlay').style.display = 'flex';
         } else {
             initDashboard();
+        }
+    </script>
+
+    <!-- Odin Chat Popup (Mimir-style FAB + panel) -->
+    <button id="odinFab" onclick="odinToggleChat()" aria-label="Ask Odin">💬</button>
+    <div id="odinChat">
+        <div id="odinResize" onmousedown="odinStartResize(event)"></div>
+        <div class="oc-head">
+            <div class="t">🏛️ Ask Odin <small>· AI SOC analyst</small></div>
+            <div style="display:flex;gap:.3rem;align-items:center">
+                <button onclick="odinMaximize()" id="odinMaxBtn" aria-label="Maximize" title="Maximize / restore">⤢</button>
+                <button onclick="odinToggleChat()" aria-label="Close">✕</button>
+            </div>
+        </div>
+        <div class="oc-msgs" id="ocMsgs">
+            <div class="oc-empty" id="ocEmpty">
+                Hi, I'm Odin. I investigate your infrastructure &amp; security — read-only.<br><br>
+                <span class="oc-chip" onclick="odinAsk(this)">List critical Wazuh alerts (level ≥ 10)</span>
+                <span class="oc-chip" onclick="odinAsk(this)">Tell me about the LLM01 prompt injection alert</span>
+                <span class="oc-chip" onclick="odinAsk(this)">How many alerts have level ≥ 10?</span>
+            </div>
+        </div>
+        <div class="oc-foot">
+            <input id="ocInput" placeholder="Ask about alerts, scans, tests…" onkeydown="if(event.key==='Enter')odinSend()">
+            <button id="ocSend" onclick="odinSend()">Send</button>
+        </div>
+    </div>
+    <script>
+        const ocMsgs = document.getElementById('ocMsgs');
+        let ocHistory = [], ocBusy = false;
+        function odinMaximize(){
+            const p = document.getElementById('odinChat');
+            const on = p.classList.toggle('maximized');
+            document.getElementById('odinMaxBtn').textContent = on ? '⤡' : '⤢';
+            // clear any inline size from a previous drag so the maximized class wins
+            if (on) { p.style.width=''; p.style.height=''; }
+        }
+        function odinStartResize(e){
+            e.preventDefault();
+            const p = document.getElementById('odinChat');
+            p.classList.remove('maximized');
+            document.getElementById('odinMaxBtn').textContent = '⤢';
+            const rect = p.getBoundingClientRect();
+            const startX = e.clientX, startY = e.clientY, startW = rect.width, startH = rect.height;
+            function move(ev){
+                // dragging the TOP-LEFT handle: panel is anchored bottom-right, so growing = moving left/up
+                const dw = startX - ev.clientX, dh = startY - ev.clientY;
+                p.style.width  = Math.max(340, Math.min(window.innerWidth  - 48, startW + dw)) + 'px';
+                p.style.height = Math.max(380, Math.min(window.innerHeight - 48, startH + dh)) + 'px';
+            }
+            function up(){ document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); }
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+        }
+        function odinToggleChat(){
+            const p = document.getElementById('odinChat'), f = document.getElementById('odinFab');
+            const open = p.classList.toggle('open');
+            f.classList.toggle('open', open);
+            f.textContent = open ? '✕' : '💬';
+            if(open) setTimeout(()=>document.getElementById('ocInput').focus(), 80);
+        }
+        function odinAsk(chip){ document.getElementById('ocInput').value = chip.textContent.trim(); odinSend(); }
+        function ocAdd(role, text){
+            const d = document.createElement('div'); d.className = 'oc-msg ' + role;
+            d.innerHTML = '<div class="r">' + role + '</div><div class="b">' + (text ? marked.parse(text) : '') + '</div>';
+            ocMsgs.appendChild(d); ocMsgs.scrollTop = ocMsgs.scrollHeight; return d;
+        }
+        async function odinSend(){
+            if(ocBusy) return;
+            const input = document.getElementById('ocInput'), text = input.value.trim();
+            if(!text) return;
+            const empty = document.getElementById('ocEmpty'); if(empty) empty.remove();
+            input.value = ''; ocBusy = true; document.getElementById('ocSend').disabled = true;
+            ocAdd('user', text); ocHistory.push({role:'user', content:text});
+            const asst = ocAdd('assistant', ''); const body = asst.querySelector('.b');
+            try {
+                const res = await fetch('/api/chat', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ messages: ocHistory }) });
+                const reader = res.body.getReader(), dec = new TextDecoder();
+                let buf = '', acc = '';
+                while(true){
+                    const {done, value} = await reader.read(); if(done) break;
+                    buf += dec.decode(value, {stream:true}); let idx;
+                    while((idx = buf.indexOf('\n\n')) >= 0){
+                        const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
+                        for(const line of chunk.split('\n')){
+                            const l = line.trim(); if(!l.startsWith('data:')) continue;
+                            const payload = l.slice(5).trim(); if(!payload) continue;
+                            let ev; try { ev = JSON.parse(payload); } catch { continue; }
+                            if(ev.type==='delta'){ acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_call'){ const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='error'){ body.innerHTML += '<div class="oc-err">'+ev.message+'</div>'; }
+                        }
+                    }
+                }
+                if(acc) ocHistory.push({role:'assistant', content:acc});
+            } catch(e){ body.innerHTML = '<div class="oc-err">'+e.message+'</div>'; }
+            finally { ocBusy = false; document.getElementById('ocSend').disabled = false; }
         }
     </script>
 </body>

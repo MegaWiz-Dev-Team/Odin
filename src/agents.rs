@@ -20,6 +20,7 @@ pub struct AgentConfig {
     pub muninn_url: String,
     pub forseti_url: String,
     pub mjolnir_url: String,
+    pub loki_url: String,
     pub discord_token: Option<String>,
     pub discord_channel_id: String,
     pub discord_webhook_url: Option<String>,
@@ -51,6 +52,8 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://forseti.asgard.svc.cluster.local:5555".into()),
             mjolnir_url: env::var("MJOLNIR_URL")
                 .unwrap_or_else(|_| "http://mjolnir.asgard.svc.cluster.local:8700".into()),
+            loki_url: env::var("LOKI_URL")
+                .unwrap_or_else(|_| "http://loki-api.asgard.svc.cluster.local:8000".into()),
             discord_token: env::var("DISCORD_TOKEN").ok(),
             discord_channel_id: env::var("DISCORD_CHANNEL_ID").unwrap_or_default(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
@@ -152,6 +155,13 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             let id = arg_str(args, "run_id")?;
             json_get(&client, &format!("{}/api/load/results/{}", cfg.mjolnir_url, id)).await
         }
+
+        // Loki — authorized pen-test system (read-only here; no attack trigger)
+        "loki_list_results" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(200);
+            json_get(&client, &format!("{}/api/v1/loki/results?limit={}", cfg.loki_url, limit)).await
+        }
+        "loki_stats" => json_get(&client, &format!("{}/api/v1/loki/results/stats", cfg.loki_url)).await,
 
         _ => Err(anyhow!("unknown tool: {}", name)),
     }
@@ -340,6 +350,12 @@ pub fn tool_definitions() -> Value {
         tool("mjolnir_run_results", "Mjölnir: get full results (latency, throughput, errors) for a load-test run", json!({
             "run_id": { "type": "string", "description": "load test run id" }
         })),
+
+        // Loki — Authorized Penetration Testing System (red team)
+        tool("loki_list_results", "Loki (Authorized Pen-Test / Red Team): list recent offensive security test results — API injection, prompt injection, data exfiltration, SIEM evasion attempts run against Asgard services. Pairs with Tyr: Loki attacks, Tyr detects.", json!({
+            "limit": { "type": "integer", "description": "max results, default 50, max 200" }
+        })),
+        tool("loki_stats", "Loki: aggregate pen-test stats — counts by severity and by test_type, plus recent tests", json!({})),
     ])
 }
 

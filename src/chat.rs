@@ -52,6 +52,7 @@ pub async fn run_agent(
             "tools": tools,
             "stream": false,
             "temperature": 0.3,
+            "max_tokens": 4096,
         });
 
         let client = http_client();
@@ -166,6 +167,7 @@ pub async fn chat_handler(
                 "tools": tools,
                 "stream": true,
                 "temperature": 0.3,
+                "max_tokens": 4096,
             });
 
             let client = http_client_streaming();
