@@ -195,6 +195,56 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
+struct SaveReportRequest {
+    title: Option<String>,
+    content: String,
+}
+
+/// Save a chat report into the Wazuh indexer as an audit record
+/// (`odin-reports-YYYY.MM` index). Server-side so the browser/Tailscale never
+/// needs indexer access. Returns the doc id on success.
+async fn save_report(
+    State(state): State<ChatState>,
+    Json(req): Json<SaveReportRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let title = req.title.unwrap_or_else(|| "Odin report".to_string());
+    // index name carries no date math here (clusters reject dynamic dates in path);
+    // use a fixed rolling index — OpenSearch ISM/aliases can roll it later.
+    let url = format!("{}/odin-reports/_doc?refresh=wait_for", cfg.tyr_indexer_url);
+    let body = serde_json::json!({
+        "title": title,
+        "content": req.content,
+        "source": "odin-chat",
+    });
+    let resp = client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            Json(serde_json::json!({
+                "status": "saved",
+                "id": v.get("_id"),
+                "index": "odin-reports"
+            })).into_response()
+        }
+        Ok(r) => {
+            let code = r.status().as_u16();
+            (StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("indexer {}", code)}))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("indexer unreachable: {}", e)}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct CreateIssueRequest {
     service: Option<String>,
     repo: Option<String>,        // explicit owner/repo overrides service mapping
@@ -286,6 +336,7 @@ async fn main() {
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/issues/create", post(create_issue))
+        .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));
 

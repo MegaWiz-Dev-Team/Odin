@@ -351,6 +351,13 @@
         .oc-issue-btn:disabled { opacity:.5; }
         .oc-issue-status { font-size:.76rem; }
         .oc-err { color:var(--danger); font-size:.85rem; }
+        .oc-typing { display:inline-flex; gap:4px; padding:.3rem 0; }
+        .oc-typing span { width:6px; height:6px; border-radius:50%; background:var(--text-muted); animation:ocblink 1.2s infinite both; }
+        .oc-typing span:nth-child(2){ animation-delay:.2s } .oc-typing span:nth-child(3){ animation-delay:.4s }
+        @keyframes ocblink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
+        .oc-actions { display:flex; gap:.4rem; margin-top:.4rem; }
+        .oc-actbtn { font-size:.72rem; padding:.2rem .6rem; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text-muted); cursor:pointer; }
+        .oc-actbtn:hover { border-color:var(--mint); color:var(--mint-dark); }
         .oc-foot { padding:.8rem; border-top:1px solid var(--border); display:flex; gap:.6rem; background:var(--surface); }
         .oc-foot input { flex:1; padding:.7rem .9rem; border:1px solid var(--border); border-radius:10px; font-size:.92rem; font-family:inherit; }
         .oc-foot input:focus { outline:none; border-color:var(--mint); }
@@ -1049,6 +1056,32 @@
             return d;
         }
 
+        // Add Copy + Save-to-Tyr buttons under a finished assistant message.
+        function ocAddActions(asst, text){
+            const bar = document.createElement('div'); bar.className = 'oc-actions';
+            const copyBtn = document.createElement('button'); copyBtn.className='oc-actbtn'; copyBtn.textContent='\ud83d\udccb Copy';
+            copyBtn.onclick = async () => {
+                try { await navigator.clipboard.writeText(text); copyBtn.textContent='\u2705 Copied'; setTimeout(()=>copyBtn.textContent='\ud83d\udccb Copy',1500); }
+                catch { copyBtn.textContent='\u274c'; }
+            };
+            const saveBtn = document.createElement('button'); saveBtn.className='oc-actbtn'; saveBtn.textContent='\ud83d\udcbe Save to Tyr';
+            saveBtn.onclick = async () => {
+                saveBtn.disabled=true; saveBtn.textContent='\u2026';
+                try {
+                    const title = text.split('\n').find(l=>l.trim())?.slice(0,80) || 'Odin report';
+                    const res = await fetch('/api/reports/save', {
+                        method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}),
+                        body: JSON.stringify({ title, content: text })
+                    });
+                    const j = await res.json();
+                    saveBtn.textContent = j.status==='saved' ? '\u2705 Saved' : ('\u274c '+(j.error||'fail'));
+                } catch(e){ saveBtn.textContent='\u274c '+e.message; }
+                setTimeout(()=>{ saveBtn.disabled=false; if(saveBtn.textContent.startsWith('\u2705')) saveBtn.textContent='\ud83d\udcbe Save to Tyr'; }, 2000);
+            };
+            bar.appendChild(copyBtn); bar.appendChild(saveBtn);
+            asst.appendChild(bar); ocMsgs.scrollTop = ocMsgs.scrollHeight;
+        }
+
         async function odinSend(){
             if(ocBusy) return;
             const input = document.getElementById('ocInput'), text = input.value.trim();
@@ -1057,6 +1090,9 @@
             input.value = ''; ocBusy = true; document.getElementById('ocSend').disabled = true;
             ocAdd('user', text); ocHistory.push({role:'user', content:text});
             const asst = ocAdd('assistant', ''); const body = asst.querySelector('.b');
+            body.innerHTML = '<div class="oc-typing"><span></span><span></span><span></span></div>';
+            let firstChunk = true;
+            const clearTyping = () => { if(firstChunk){ body.innerHTML=''; firstChunk=false; } };
             try {
                 const res = await fetch('/api/chat', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ messages: ocHistory }) });
                 const reader = res.body.getReader(), dec = new TextDecoder();
@@ -1070,15 +1106,16 @@
                             const l = line.trim(); if(!l.startsWith('data:')) continue;
                             const payload = l.slice(5).trim(); if(!payload) continue;
                             let ev; try { ev = JSON.parse(payload); } catch { continue; }
-                            if(ev.type==='delta'){ acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
-                            else if(ev.type==='tool_call'){ const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
-                            else if(ev.type==='tool_result' && ev.name==='propose_github_issue' && ev.result){ asst.appendChild(odinIssueCard(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            if(ev.type==='delta'){ clearTyping(); acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_call'){ clearTyping(); const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_result' && ev.name==='propose_github_issue' && ev.result){ clearTyping(); asst.appendChild(odinIssueCard(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='error'){ body.innerHTML += '<div class="oc-err">'+ev.message+'</div>'; }
                         }
                     }
                 }
-                if(acc) ocHistory.push({role:'assistant', content:acc});
-            } catch(e){ body.innerHTML = '<div class="oc-err">'+e.message+'</div>'; }
+                if(acc){ ocHistory.push({role:'assistant', content:acc}); ocAddActions(asst, acc); }
+                else { clearTyping(); }
+            } catch(e){ clearTyping(); body.innerHTML = '<div class="oc-err">'+e.message+'</div>'; }
             finally { ocBusy = false; document.getElementById('ocSend').disabled = false; }
         }
     </script>
