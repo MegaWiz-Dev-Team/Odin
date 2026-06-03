@@ -119,6 +119,23 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
             tyr_search_alerts(&client, cfg, q, size).await
         }
+        // SCA — CIS-benchmark / hardening findings (alerts tagged rule.groups:sca)
+        "tyr_sca_results" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+            tyr_search_alerts(&client, cfg, "rule.groups:sca", size).await
+        }
+        // Rootcheck — rootkit / policy / anomaly findings
+        "tyr_rootcheck" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+            tyr_search_alerts(&client, cfg, "rule.groups:rootcheck", size).await
+        }
+        // Vulnerability inventory — CVEs per agent (Wazuh vuln-detection state index)
+        "tyr_vuln_inventory" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(30).min(100);
+            tyr_vuln_inventory(&client, cfg, size).await
+        }
+        // MITRE ATT&CK — top techniques seen across recent alerts
+        "tyr_mitre_summary" => tyr_mitre_summary(&client, cfg).await,
 
         "vardr_health" => json_get(&client, &format!("{}/health", cfg.vardr_url)).await,
         "vardr_list_services" => json_get(&client, &format!("{}/api/services", cfg.vardr_url)).await,
@@ -465,6 +482,62 @@ pub async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, 
         .unwrap_or_default();
     let total = parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(hits.len()));
     Ok(json!({ "total": total, "alerts": hits }))
+}
+
+/// Vulnerability inventory — CVEs from Wazuh's vuln-detection state index.
+/// Returns empty (with a note) if vuln-detection isn't enabled / no agents scanned.
+pub async fn tyr_vuln_inventory(client: &Client, cfg: &AgentConfig, size: u64) -> Result<Value> {
+    let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
+    let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
+    let url = format!("{}/wazuh-states-vulnerabilities-*/_search", cfg.tyr_indexer_url);
+    let body = json!({
+        "size": size,
+        "query": { "match_all": {} },
+        "_source": ["agent.name", "package.name", "package.version", "vulnerability.id",
+                    "vulnerability.severity", "vulnerability.score.base", "vulnerability.status"]
+    });
+    let res = client.post(&url).header("Authorization", basic).header("Content-Type", "application/json")
+        .json(&body).send().await.map_err(|e| anyhow!("indexer request failed: {}", e))?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Ok(json!({ "total": 0, "vulnerabilities": [],
+            "note": format!("no vulnerability data (indexer {}). Vuln-detection may be disabled or no agents scanned yet.", status) }));
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let hits = parsed.pointer("/hits/hits").and_then(|h| h.as_array())
+        .map(|a| a.iter().filter_map(|h| h.get("_source").cloned()).collect::<Vec<_>>()).unwrap_or_default();
+    let total = parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(hits.len()));
+    Ok(json!({ "total": total, "vulnerabilities": hits }))
+}
+
+/// MITRE ATT&CK — aggregate recent alerts by technique + tactic (threat-hunting context).
+pub async fn tyr_mitre_summary(client: &Client, cfg: &AgentConfig) -> Result<Value> {
+    let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
+    let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
+    let url = format!("{}/wazuh-alerts-*/_search", cfg.tyr_indexer_url);
+    let body = json!({
+        "size": 0,
+        "query": { "exists": { "field": "rule.mitre.id" } },
+        "aggs": {
+            "techniques": { "terms": { "field": "rule.mitre.technique", "size": 15 } },
+            "tactics": { "terms": { "field": "rule.mitre.tactic", "size": 15 } }
+        }
+    });
+    let res = client.post(&url).header("Authorization", basic).header("Content-Type", "application/json")
+        .json(&body).send().await.map_err(|e| anyhow!("indexer request failed: {}", e))?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Ok(json!({ "alerts_with_mitre": 0, "top_techniques": [], "top_tactics": [],
+            "note": format!("indexer {}", status) }));
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "alerts_with_mitre": parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(0)),
+        "top_techniques": parsed.pointer("/aggregations/techniques/buckets").cloned().unwrap_or(json!([])),
+        "top_tactics": parsed.pointer("/aggregations/tactics/buckets").cloned().unwrap_or(json!([]))
+    }))
 }
 
 async fn json_get(client: &Client, url: &str) -> Result<Value> {
@@ -873,6 +946,16 @@ pub fn tool_definitions() -> Value {
             "query": { "type": "string", "description": "Lucene query, default '*' (last N alerts)" },
             "size": { "type": "integer", "description": "max alerts to return, default 20, max 100" }
         })),
+        tool("tyr_sca_results", "Týr SCA (Security Configuration Assessment): recent CIS-benchmark / hardening findings (failed checks). Use to report host config-hardening posture.", json!({
+            "size": { "type": "integer", "description": "max findings, default 20, max 100" }
+        })),
+        tool("tyr_rootcheck", "Týr Rootcheck: rootkit / policy-violation / anomaly findings on monitored hosts.", json!({
+            "size": { "type": "integer", "description": "max findings, default 20, max 100" }
+        })),
+        tool("tyr_vuln_inventory", "Týr Vulnerability Detection: CVE inventory per agent (package, CVE id, severity, CVSS). Returns empty with a note if vuln-detection isn't enabled / no agents scanned yet.", json!({
+            "size": { "type": "integer", "description": "max CVEs, default 30, max 100" }
+        })),
+        tool("tyr_mitre_summary", "Týr MITRE ATT&CK: top techniques & tactics seen across recent alerts — threat-hunting context (e.g. 'this alert maps to T1190'). No args.", json!({})),
 
         // Várðr — Monitoring
         tool("vardr_health", "Várðr (Monitoring): service health", json!({})),
