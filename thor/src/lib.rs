@@ -14,6 +14,7 @@ use regorus::{Engine, Value};
 /// Policies compiled into the binary.
 const MERGE_POLICY: &str = include_str!("../policies/merge.rego");
 const CREATE_POLICY: &str = include_str!("../policies/create.rego");
+const ACTIVE_RESPONSE_POLICY: &str = include_str!("../policies/active_response.rego");
 
 /// Result of a policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,11 @@ pub fn evaluate_merge(input_json: &str) -> Verdict {
 /// Evaluate the issue-creation policy. Input shape — see `policies/create.rego`.
 pub fn evaluate_create(input_json: &str) -> Verdict {
     evaluate("create.rego", CREATE_POLICY, "thor.create", input_json)
+}
+
+/// Evaluate the Active-Response policy. Input — see `policies/active_response.rego`.
+pub fn evaluate_active_response(input_json: &str) -> Verdict {
+    evaluate("active_response.rego", ACTIVE_RESPONSE_POLICY, "thor.active_response", input_json)
 }
 
 #[cfg(test)]
@@ -213,5 +219,39 @@ mod tests {
         let v = evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 42, false, 0));
         assert!(v.allow);
         assert!(v.warnings.iter().any(|m| m.contains("body is empty")));
+    }
+
+    // ── active response policy ──
+    fn arinput(cmd: &str, agents: serde_json::Value, allow_all: bool) -> String {
+        json!({ "command": cmd, "agents": agents, "policy": {
+            "allowed_commands": ["firewall-drop", "restart-wazuh", "disable-account"],
+            "allow_all_agents": allow_all
+        }}).to_string()
+    }
+
+    #[test]
+    fn ar_allows_allowlisted_command() {
+        let v = evaluate_active_response(&arinput("firewall-drop", json!(["001"]), false));
+        assert!(v.allow, "violations: {:?}", v.violations);
+    }
+
+    #[test]
+    fn ar_denies_unknown_command() {
+        let v = evaluate_active_response(&arinput("rm-rf-everything", json!(["001"]), false));
+        assert!(!v.allow);
+        assert!(v.violations.iter().any(|m| m.contains("allowlist")));
+    }
+
+    #[test]
+    fn ar_denies_no_agents() {
+        assert!(!evaluate_active_response(&arinput("firewall-drop", json!([]), false)).allow);
+    }
+
+    #[test]
+    fn ar_blocks_mass_or_manager_target() {
+        assert!(!evaluate_active_response(&arinput("firewall-drop", json!(["all"]), false)).allow);
+        assert!(!evaluate_active_response(&arinput("firewall-drop", json!(["000"]), false)).allow);
+        // allowed when explicitly permitted
+        assert!(evaluate_active_response(&arinput("firewall-drop", json!(["all"]), true)).allow);
     }
 }

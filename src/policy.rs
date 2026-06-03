@@ -114,3 +114,44 @@ pub fn check_create(policy: &CreatePolicy, repo: &str, title: &str, body: &str) 
     });
     thor::evaluate_create(&input.to_string())
 }
+
+// ── active-response policy ──────────────────────────────────────────────────
+
+pub struct ActiveResponsePolicy {
+    pub allowed_commands: Vec<String>,
+    pub allow_all_agents: bool,
+}
+
+impl ActiveResponsePolicy {
+    pub fn from_env() -> Self {
+        let cmds = std::env::var("THOR_AR_ALLOWED_COMMANDS")
+            .unwrap_or_else(|_| "firewall-drop,restart-wazuh,disable-account".to_string());
+        Self {
+            allowed_commands: cmds
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            allow_all_agents: std::env::var("THOR_AR_ALLOW_ALL_AGENTS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Build the Rego input for an Active Response and evaluate via the `thor` crate.
+pub fn check_active_response(
+    policy: &ActiveResponsePolicy,
+    command: &str,
+    agents: &[String],
+) -> Verdict {
+    let input = json!({
+        "command": command,
+        "agents": agents,
+        "policy": {
+            "allowed_commands": policy.allowed_commands,
+            "allow_all_agents": policy.allow_all_agents,
+        }
+    });
+    thor::evaluate_active_response(&input.to_string())
+}

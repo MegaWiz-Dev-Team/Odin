@@ -261,6 +261,14 @@ struct MergePrRequest {
     method: Option<String>,      // merge | squash | rebase (default squash)
 }
 
+#[derive(Deserialize)]
+struct ActiveResponseRequest {
+    command: String,
+    agents: Vec<String>,
+    #[serde(default)]
+    arguments: Vec<String>,
+}
+
 /// HITL confirm endpoint — the human clicked "Create" on a proposed issue.
 /// Dedups, creates the GitHub issue server-side (token never reaches the browser),
 /// records the fingerprint, and audits. This is the only place an issue is created.
@@ -363,6 +371,47 @@ async fn merge_pr(
     }
 }
 
+/// HITL confirm endpoint (T3) — send a Wazuh Active Response after a human clicks.
+/// Thor-gated (command allowlist + agent-target policy), then dispatched to the
+/// Wazuh manager API, and audited. The enforcement counterpart to Odin's read tools.
+async fn active_response(
+    State(state): State<ChatState>,
+    Json(req): Json<ActiveResponseRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+
+    // Thor policy gate
+    let policy = crate::policy::ActiveResponsePolicy::from_env();
+    let verdict = crate::policy::check_active_response(&policy, &req.command, &req.agents);
+    if !verdict.allow {
+        crate::agents::audit_event(&client, &cfg, "active_response_denied", serde_json::json!({
+            "command": req.command, "agents": req.agents, "gate": "thor",
+            "violations": verdict.violations, "warnings": verdict.warnings,
+        })).await;
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "violations": verdict.violations,
+            "warnings": verdict.warnings,
+        }))).into_response();
+    }
+
+    let outcome = crate::agents::active_response_core(
+        &client, &cfg, &req.command, &req.agents, &req.arguments,
+    ).await;
+    crate::agents::audit_event(&client, &cfg, "active_response", serde_json::json!({
+        "command": req.command, "agents": req.agents,
+        "result": outcome.get("status"), "thor_warnings": verdict.warnings,
+    })).await;
+
+    let ok = outcome.get("status").and_then(|s| s.as_str()) == Some("sent");
+    if ok {
+        Json(outcome).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(outcome)).into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -385,6 +434,7 @@ async fn main() {
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))
+        .route("/api/active-response", post(active_response))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));

@@ -263,6 +263,25 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             }))
         }
 
+        // propose_active_response — READ-ONLY proposal (T3 gated). The real send
+        // happens via POST /api/active-response after a click (Thor-gated).
+        "propose_active_response" => {
+            let command = arg_str(args, "command")?;
+            let agents: Vec<String> = args
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Ok(json!({
+                "action": "propose_active_response",
+                "command": command,
+                "agents": agents,
+                "needs_confirmation": true,
+                "tier": "T3",
+                "note": "Proposal only — confirm in the UI to send the Active Response (T3). Gated by Thor policy; requires AR configured on the Wazuh side to actually execute."
+            }))
+        }
+
         _ => Err(anyhow!("unknown tool: {}", name)),
     }
 }
@@ -321,8 +340,8 @@ pub async fn knowledge_search(client: &Client, cfg: &AgentConfig, query: &str, l
     }
 }
 
-async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value> {
-    // Step 1 — basic auth → JWT
+/// Wazuh manager API auth: basic creds → short-lived JWT.
+async fn tyr_jwt(client: &Client, cfg: &AgentConfig) -> Result<String> {
     let creds = format!("{}:{}", cfg.tyr_user, cfg.tyr_pass);
     let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
     let auth_url = format!("{}/security/user/authenticate", cfg.tyr_url);
@@ -335,16 +354,24 @@ async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value
     if !auth_res.status().is_success() {
         let s = auth_res.status();
         let b = auth_res.text().await.unwrap_or_default();
-        return Ok(json!({ "error": format!("tyr auth {}: {}", s, b) }));
+        return Err(anyhow!("tyr auth {}: {}", s, b));
     }
-    let auth_json: Value = auth_res.json().await
+    let auth_json: Value = auth_res
+        .json()
+        .await
         .map_err(|e| anyhow!("tyr auth json parse: {}", e))?;
-    let jwt = auth_json
+    auth_json
         .pointer("/data/token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("no JWT in tyr auth response"))?;
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("no JWT in tyr auth response"))
+}
 
-    // Step 2 — call actual endpoint with JWT bearer
+async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value> {
+    let jwt = match tyr_jwt(client, cfg).await {
+        Ok(j) => j,
+        Err(e) => return Ok(json!({ "error": e.to_string() })),
+    };
     let url = format!("{}{}", cfg.tyr_url, path);
     let res = client
         .get(&url)
@@ -358,6 +385,47 @@ async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value
         return Ok(json!({ "error": format!("tyr {}: {}", status, body) }));
     }
     serde_json::from_str(&body).map_err(|e| anyhow!("tyr json parse: {}", e))
+}
+
+/// Send a Wazuh Active Response command to agents (T3 enforcement). Called by
+/// POST /api/active-response after human confirm + Thor gate. NOTE: actual
+/// execution requires the AR command to be configured on the Wazuh side
+/// (ossec.conf <active-response> + the script on agents).
+pub async fn active_response_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    command: &str,
+    agents: &[String],
+    arguments: &[String],
+) -> Value {
+    let jwt = match tyr_jwt(client, cfg).await {
+        Ok(j) => j,
+        Err(e) => return json!({ "status": "error", "error": e.to_string() }),
+    };
+    let agents_list = if agents.is_empty() { "*".to_string() } else { agents.join(",") };
+    let url = format!("{}/active-response?agents_list={}", cfg.tyr_url, agents_list);
+    let body = json!({ "command": command, "arguments": arguments, "alert": {} });
+    let res = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", jwt))
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                json!({ "status": "sent", "command": command, "agents": agents, "result": v.get("data") })
+            } else {
+                json!({
+                    "status": "error", "command": command,
+                    "error": v.get("detail").or_else(|| v.get("title")).cloned().unwrap_or(json!("wazuh rejected"))
+                })
+            }
+        }
+        Err(e) => json!({ "status": "error", "error": format!("wazuh AR unreachable: {}", e) }),
+    }
 }
 
 pub async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size: u64) -> Result<Value> {
@@ -893,6 +961,13 @@ pub fn tool_definitions() -> Value {
         tool("propose_pr_merge", "Propose merging a pull request (does NOT merge — returns a proposal + review info the human confirms with a button). T3 prod write; merge only happens after the click via /api/pulls/merge.", json!({
             "repo": { "type": "string", "description": "'owner/repo'" },
             "number": { "type": "integer", "description": "pull request number to merge" }
+        })),
+
+        // propose_active_response — Týr enforcement arm (T3). Proposal only; the send
+        // is executed + Thor-gated via POST /api/active-response after a human click.
+        tool("propose_active_response", "Propose a Wazuh Active Response (e.g. firewall-drop to block an IP, restart-wazuh, disable-account) on one or more agents. Does NOT execute — returns a proposal the human confirms. T3 enforcement; Thor-gated.", json!({
+            "command": { "type": "string", "description": "AR command name, e.g. 'firewall-drop', 'restart-wazuh', 'disable-account'" },
+            "agents": { "type": "array", "items": { "type": "string" }, "description": "target agent IDs, e.g. ['001']" }
         })),
     ])
 }
