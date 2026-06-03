@@ -520,6 +520,21 @@ pub async fn create_issue_core(
         };
     }
 
+    // Thor policy gate (create) — centralised here so BOTH the HITL endpoint and
+    // the autonomous Týr bridge are governed (org allowlist, title/body sanity).
+    let verdict = crate::policy::check_create(
+        &crate::policy::CreatePolicy::from_env(), repo, title, body,
+    );
+    if !verdict.allow {
+        return IssueOutcome {
+            status: "denied",
+            issue_url: None,
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: Some(format!("Thor denied: {}", verdict.violations.join("; "))),
+        };
+    }
+
     let token = match &cfg.github_token {
         Some(t) => t.clone(),
         None => {

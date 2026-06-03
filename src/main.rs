@@ -293,6 +293,11 @@ async fn create_issue(
             "repo": outcome.repo,
             "fingerprint": outcome.fingerprint,
         })).into_response(),
+        "denied" => (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "error": outcome.error.unwrap_or_else(|| "denied by policy".into()),
+            "repo": outcome.repo,
+        }))).into_response(),
         _ => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
             "error": outcome.error.unwrap_or_else(|| "github error".into()),
             "repo": outcome.repo,

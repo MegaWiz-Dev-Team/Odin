@@ -76,3 +76,41 @@ pub fn check_merge(policy: &MergePolicy, pr: &Value) -> Verdict {
 
     thor::evaluate_merge(&input.to_string())
 }
+
+// ── issue-creation policy ───────────────────────────────────────────────────
+
+pub struct CreatePolicy {
+    pub org_prefix: String,
+    pub max_title: u64,
+    pub max_body: u64,
+}
+
+impl CreatePolicy {
+    pub fn from_env() -> Self {
+        let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Self {
+            org_prefix: std::env::var("THOR_ORG_PREFIX")
+                .unwrap_or_else(|_| "MegaWiz-Dev-Team/".to_string()),
+            max_title: num("THOR_MAX_TITLE", 200),
+            max_body: num("THOR_MAX_BODY", 20000),
+        }
+    }
+}
+
+/// Build the Rego input for issue creation (lengths precomputed) and evaluate via
+/// the `thor` crate. Used centrally in `agents::create_issue_core` so both the
+/// HITL endpoint and the autonomous Týr bridge are governed.
+pub fn check_create(policy: &CreatePolicy, repo: &str, title: &str, body: &str) -> Verdict {
+    let input = json!({
+        "repo": repo,
+        "title_len": title.chars().count() as u64,
+        "title_empty": title.trim().is_empty(),
+        "body_len": body.chars().count() as u64,
+        "policy": {
+            "org_prefix": policy.org_prefix,
+            "max_title": policy.max_title,
+            "max_body": policy.max_body,
+        }
+    });
+    thor::evaluate_create(&input.to_string())
+}

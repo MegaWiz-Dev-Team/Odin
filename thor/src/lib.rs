@@ -5,13 +5,15 @@
 //! (`policies/*.rego`), not hand-rolled Rust `if`s, so it can be reviewed, tested
 //! and (later) hot-swapped without recompiling call sites.
 //!
-//! v1 surface: PR-merge policy. The same engine pattern will gate other T3 paths
-//! (Loki guards, Bifrost/Iris writes) by adding more policies + entry points.
+//! Surface: PR-merge + issue-creation policies. The same engine pattern gates more
+//! T2/T3 paths (Active Response, Loki guards, Bifrost/Iris writes) by adding a
+//! `.rego` file + an entry point.
 
 use regorus::{Engine, Value};
 
-/// The merge policy, compiled into the binary.
+/// Policies compiled into the binary.
 const MERGE_POLICY: &str = include_str!("../policies/merge.rego");
+const CREATE_POLICY: &str = include_str!("../policies/create.rego");
 
 /// Result of a policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,13 +54,13 @@ fn eval_strings(engine: &mut Engine, rule: &str) -> Vec<String> {
     out
 }
 
-/// Evaluate the PR-merge policy against the given input JSON.
+/// Generic evaluator: load `policy_src`, set `input_json`, query the rules under
+/// the `pkg` package (`data.<pkg>.{allow,violations,warnings}`).
 ///
-/// Input shape — see `policies/merge.rego`. **Fails closed**: any policy-load or
-/// input-parse error yields `allow = false` with an explanatory violation, so a
-/// broken policy can never silently wave a merge through.
-pub fn evaluate_merge(input_json: &str) -> Verdict {
-    let mut engine = match load_engine("merge.rego", MERGE_POLICY) {
+/// **Fails closed**: any policy-load or input-parse error yields `allow = false`
+/// with an explanatory violation, so a broken policy can never wave an action through.
+fn evaluate(policy_name: &str, policy_src: &str, pkg: &str, input_json: &str) -> Verdict {
+    let mut engine = match load_engine(policy_name, policy_src) {
         Ok(e) => e,
         Err(e) => return Verdict::denied(format!("thor policy load error: {e}")),
     };
@@ -68,10 +70,10 @@ pub fn evaluate_merge(input_json: &str) -> Verdict {
     };
     engine.set_input(input);
 
-    let violations = eval_strings(&mut engine, "data.thor.merge.violations");
-    let warnings = eval_strings(&mut engine, "data.thor.merge.warnings");
+    let violations = eval_strings(&mut engine, &format!("data.{pkg}.violations"));
+    let warnings = eval_strings(&mut engine, &format!("data.{pkg}.warnings"));
     let allow_rule = engine
-        .eval_rule("data.thor.merge.allow".to_string())
+        .eval_rule(format!("data.{pkg}.allow"))
         .ok()
         .and_then(|v| v.as_bool().ok().copied())
         .unwrap_or(false);
@@ -80,6 +82,16 @@ pub fn evaluate_merge(input_json: &str) -> Verdict {
     // violations (guards against an out-of-sync policy).
     let allow = allow_rule && violations.is_empty();
     Verdict { allow, violations, warnings }
+}
+
+/// Evaluate the PR-merge policy. Input shape — see `policies/merge.rego`.
+pub fn evaluate_merge(input_json: &str) -> Verdict {
+    evaluate("merge.rego", MERGE_POLICY, "thor.merge", input_json)
+}
+
+/// Evaluate the issue-creation policy. Input shape — see `policies/create.rego`.
+pub fn evaluate_create(input_json: &str) -> Verdict {
+    evaluate("create.rego", CREATE_POLICY, "thor.create", input_json)
 }
 
 #[cfg(test)]
@@ -159,5 +171,47 @@ mod tests {
     fn fails_closed_on_bad_input() {
         let v = evaluate_merge("not json");
         assert!(!v.allow);
+    }
+
+    // ── create policy ──
+    fn cpol() -> serde_json::Value {
+        json!({ "org_prefix": "MegaWiz-Dev-Team/", "max_title": 200, "max_body": 20000 })
+    }
+    fn cinput(repo: &str, title_len: u64, title_empty: bool, body_len: u64) -> String {
+        json!({ "repo": repo, "title_len": title_len, "title_empty": title_empty,
+                "body_len": body_len, "policy": cpol() }).to_string()
+    }
+
+    #[test]
+    fn create_allows_normal_issue() {
+        let v = evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 42, false, 300));
+        assert!(v.allow, "violations: {:?}", v.violations);
+    }
+
+    #[test]
+    fn create_denies_empty_title() {
+        let v = evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 0, true, 300));
+        assert!(!v.allow);
+        assert!(v.violations.iter().any(|m| m.contains("title is empty")));
+    }
+
+    #[test]
+    fn create_denies_foreign_repo() {
+        let v = evaluate_create(&cinput("evil-org/x", 42, false, 300));
+        assert!(!v.allow);
+        assert!(v.violations.iter().any(|m| m.contains("outside the allowed org")));
+    }
+
+    #[test]
+    fn create_denies_oversize_title_and_body() {
+        assert!(!evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 500, false, 300)).allow);
+        assert!(!evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 42, false, 50000)).allow);
+    }
+
+    #[test]
+    fn create_warns_empty_body() {
+        let v = evaluate_create(&cinput("MegaWiz-Dev-Team/Odin", 42, false, 0));
+        assert!(v.allow);
+        assert!(v.warnings.iter().any(|m| m.contains("body is empty")));
     }
 }
