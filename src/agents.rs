@@ -40,7 +40,10 @@ impl AgentConfig {
             heimdall_url: env::var("HEIMDALL_URL")
                 .unwrap_or_else(|_| "http://host.docker.internal:8080".into()),
             heimdall_model: env::var("HEIMDALL_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+                // Default to Gemini 3.1 flash-lite via Heimdall's gemini/ routing.
+                // claude-sonnet-4-6 routing through the gateway is currently broken
+                // (HTTP 000 / times out), so it is not a safe fallback.
+                .unwrap_or_else(|_| "gemini/gemini-3.1-flash-lite".into()),
             heimdall_api_key: env::var("HEIMDALL_API_KEY").ok(),
             tyr_url: env::var("TYR_URL")
                 .unwrap_or_else(|_| "https://wazuh-manager.wazuh.svc.cluster.local:55000".into()),
