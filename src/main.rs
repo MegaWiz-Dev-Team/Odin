@@ -4,6 +4,7 @@ mod chat;
 mod discord;
 mod findings;
 mod report;
+mod thor;
 
 use axum::{
     extract::{Json, Request, State},
@@ -313,12 +314,39 @@ async fn merge_pr(
         return (StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
     }
+
+    // Thor v0 policy gate — evaluate the PR against merge policy BEFORE merging.
+    let pr = crate::agents::gh_pr_get(&client, &cfg, &req.repo, req.number).await;
+    let policy = crate::thor::ThorMergePolicy::from_env();
+    let verdict = crate::thor::check_merge(&policy, &pr);
+    if !verdict.allow {
+        crate::agents::audit_event(&client, &cfg, "pr_merge_denied", serde_json::json!({
+            "repo": req.repo, "number": req.number, "gate": "thor",
+            "violations": verdict.violations, "warnings": verdict.warnings,
+        })).await;
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "violations": verdict.violations,
+            "warnings": verdict.warnings,
+        }))).into_response();
+    }
+    if policy.dry_run {
+        crate::agents::audit_event(&client, &cfg, "pr_merge_dry_run", serde_json::json!({
+            "repo": req.repo, "number": req.number, "gate": "thor", "warnings": verdict.warnings,
+        })).await;
+        return Json(serde_json::json!({
+            "status": "dry_run", "would_merge": true,
+            "repo": req.repo, "number": req.number, "warnings": verdict.warnings,
+        })).into_response();
+    }
+
     let method = req.method.as_deref().unwrap_or("squash");
     let outcome = crate::agents::merge_pr_core(&client, &cfg, &req.repo, req.number, method).await;
 
     crate::agents::audit_event(&client, &cfg, "pr_merge", serde_json::json!({
         "repo": req.repo, "number": req.number, "method": method,
         "result": outcome.get("status"), "error": outcome.get("error"),
+        "thor_warnings": verdict.warnings,
     })).await;
 
     let ok = outcome.get("status").and_then(|s| s.as_str()) == Some("merged");
