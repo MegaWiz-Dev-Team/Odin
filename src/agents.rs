@@ -23,6 +23,10 @@ pub struct AgentConfig {
     pub loki_url: String,
     pub ratatoskr_url: String,
     pub laminar_url: String,
+    // Mimir — RAG knowledge base (Odin's AI-security KB, e.g. NCSA AI Security Guidelines)
+    pub mimir_url: String,
+    pub mimir_tenant: String,
+    pub mimir_kb_source_ids: Vec<i64>,
     pub github_token: Option<String>,
     pub github_api_url: String,
     pub discord_token: Option<String>,
@@ -62,6 +66,16 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://ratatoskr.asgard.svc.cluster.local:9200".into()),
             laminar_url: env::var("LAMINAR_URL")
                 .unwrap_or_else(|_| "http://laminar-app-server.asgard.svc.cluster.local:8000".into()),
+            mimir_url: env::var("MIMIR_URL")
+                .unwrap_or_else(|_| "http://mimir-api.asgard.svc:8080".into()),
+            mimir_tenant: env::var("MIMIR_TENANT").unwrap_or_else(|_| "asgard_platform".into()),
+            // Optional comma-separated data-source IDs to scope KB search to (e.g. "3" =
+            // NCSA AI Security Guidelines). Empty = search the whole tenant KB.
+            mimir_kb_source_ids: env::var("MIMIR_KB_SOURCE_IDS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i64>().ok())
+                .collect(),
             github_token: env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()),
             github_api_url: env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".into()),
@@ -200,7 +214,107 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             }))
         }
 
+        // Mimir — query the AI-security knowledge base (RAG)
+        "knowledge_search" => {
+            let query = arg_str(args, "query")?;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).min(10);
+            knowledge_search(&client, cfg, &query, limit).await
+        }
+
+        // Phase 5 — GitHub PR review/merge
+        "gh_pr_list" => {
+            let repo = resolve_repo(args);
+            let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("open");
+            Ok(gh_pr_list(&client, cfg, &repo, state).await)
+        }
+        "gh_pr_get" => {
+            let repo = resolve_repo(args);
+            let number = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("missing arg: number"))?;
+            Ok(gh_pr_get(&client, cfg, &repo, number).await)
+        }
+        // propose_pr_merge — READ-ONLY proposal (T3 gated). Returns PR review info +
+        // needs_confirmation; the actual merge happens via POST /api/pulls/merge after a click.
+        "propose_pr_merge" => {
+            let repo = resolve_repo(args);
+            let number = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("missing arg: number"))?;
+            let pr = gh_pr_get(&client, cfg, &repo, number).await;
+            Ok(json!({
+                "action": "propose_pr_merge",
+                "repo": repo,
+                "number": number,
+                "title": pr.get("title"),
+                "draft": pr.get("draft"),
+                "mergeable": pr.get("mergeable"),
+                "mergeable_state": pr.get("mergeable_state"),
+                "base": pr.get("base"),
+                "url": pr.get("url"),
+                "needs_confirmation": true,
+                "tier": "T3",
+                "note": "Proposal only — confirm in the UI to merge (T3 prod write). Draft PRs must be marked ready-for-review first."
+            }))
+        }
+
         _ => Err(anyhow!("unknown tool: {}", name)),
+    }
+}
+
+/// Query Mimir's RAG knowledge base for the configured tenant, optionally scoped
+/// to specific data sources (Odin's AI-security KB). Uses Mimir's dense vector
+/// search endpoint (`/api/v1/vector/search`) — the hybrid `/api/search` path
+/// currently collapses dense results via a broken BM25 fusion, so we hit the
+/// vector endpoint directly for reliable semantic recall. Returns a trimmed list
+/// of {score, content} for the LLM to ground its answer on.
+pub async fn knowledge_search(client: &Client, cfg: &AgentConfig, query: &str, limit: u64) -> Result<Value> {
+    let mut body = json!({
+        "query": query,
+        "limit": limit,
+    });
+    if !cfg.mimir_kb_source_ids.is_empty() {
+        body["source_ids"] = json!(cfg.mimir_kb_source_ids);
+    }
+    let url = format!("{}/api/v1/vector/search", cfg.mimir_url);
+    let res = client
+        .post(&url)
+        .header("X-Tenant-Id", &cfg.mimir_tenant)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Ok(json!({ "error": format!("mimir {}: {}", status, text), "url": url }));
+            }
+            let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            // Response shape: { result: { points: [ { score, payload: { content } } ] } }
+            let results = parsed
+                .pointer("/result/points")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|h| json!({
+                            "score": h.get("score").cloned().unwrap_or(json!(null)),
+                            "content": h.pointer("/payload/content").and_then(|c| c.as_str()).unwrap_or(""),
+                        }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(json!({
+                "query": query,
+                "count": results.len(),
+                "results": results,
+                "source": "NCSA AI Security Guidelines (asgard_platform KB)"
+            }))
+        }
+        Err(e) => Ok(json!({ "error": format!("mimir unreachable: {}", e), "url": url })),
     }
 }
 
@@ -468,6 +582,180 @@ pub async fn create_issue_core(
     }
 }
 
+// ── Phase 5: GitHub PR review/merge ──────────────────────────────────────────
+
+/// Resolve a target repo from tool args: prefer an explicit `repo` ("owner/repo"),
+/// else map a `service` name via service_to_repo.
+pub fn resolve_repo(args: &Value) -> String {
+    if let Some(r) = args.get("repo").and_then(|v| v.as_str()).filter(|s| s.contains('/')) {
+        return r.to_string();
+    }
+    service_to_repo(args.get("service").and_then(|v| v.as_str()).unwrap_or(""))
+}
+
+/// Authenticated GitHub GET → parsed JSON (or an {error} object — never panics).
+async fn github_get_authed(client: &Client, cfg: &AgentConfig, url: &str) -> Value {
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => return json!({ "error": "GITHUB_TOKEN not configured on Odin", "url": url }),
+    };
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return json!({ "error": format!("github {}: {}", status, text), "url": url });
+            }
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
+        }
+        Err(e) => json!({ "error": format!("github unreachable: {}", e), "url": url }),
+    }
+}
+
+/// List PRs for a repo (trimmed for the LLM). T2 read.
+pub async fn gh_pr_list(client: &Client, cfg: &AgentConfig, repo: &str, state: &str) -> Value {
+    let url = format!(
+        "{}/repos/{}/pulls?state={}&per_page=30&sort=updated&direction=desc",
+        cfg.github_api_url, repo, state
+    );
+    let v = github_get_authed(client, cfg, &url).await;
+    if v.get("error").is_some() {
+        return v;
+    }
+    let prs = v
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    json!({
+                        "number": p.get("number"),
+                        "title": p.get("title"),
+                        "draft": p.get("draft"),
+                        "state": p.get("state"),
+                        "user": p.pointer("/user/login"),
+                        "head": p.pointer("/head/ref"),
+                        "base": p.pointer("/base/ref"),
+                        "url": p.get("html_url"),
+                        "created_at": p.get("created_at"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({ "repo": repo, "count": prs.len(), "pulls": prs })
+}
+
+/// Get one PR: metadata + changed files with patches (for review). T2 read.
+pub async fn gh_pr_get(client: &Client, cfg: &AgentConfig, repo: &str, number: u64) -> Value {
+    let meta = github_get_authed(
+        client, cfg,
+        &format!("{}/repos/{}/pulls/{}", cfg.github_api_url, repo, number),
+    ).await;
+    if meta.get("error").is_some() {
+        return meta;
+    }
+    let files = github_get_authed(
+        client, cfg,
+        &format!("{}/repos/{}/pulls/{}/files?per_page=50", cfg.github_api_url, repo, number),
+    ).await;
+    let files_trim = files
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|f| {
+                    json!({
+                        "filename": f.get("filename"),
+                        "status": f.get("status"),
+                        "additions": f.get("additions"),
+                        "deletions": f.get("deletions"),
+                        "patch": f.get("patch"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "repo": repo,
+        "number": number,
+        "title": meta.get("title"),
+        "draft": meta.get("draft"),
+        "state": meta.get("state"),
+        "mergeable": meta.get("mergeable"),
+        "mergeable_state": meta.get("mergeable_state"),
+        "head": meta.pointer("/head/ref"),
+        "base": meta.pointer("/base/ref"),
+        "body": meta.get("body"),
+        "url": meta.get("html_url"),
+        "files": files_trim,
+    })
+}
+
+/// Merge a PR (T3, prod write). Called by POST /api/pulls/merge after a human
+/// confirms. `method` = merge | squash | rebase.
+pub async fn merge_pr_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    number: u64,
+    method: &str,
+) -> Value {
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => return json!({ "status": "error", "error": "GITHUB_TOKEN not configured on Odin" }),
+    };
+    let url = format!("{}/repos/{}/pulls/{}/merge", cfg.github_api_url, repo, number);
+    let payload = json!({ "merge_method": method });
+    let resp = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                json!({ "status": "merged", "repo": repo, "number": number, "sha": v.get("sha") })
+            } else {
+                json!({
+                    "status": "error", "repo": repo, "number": number,
+                    "error": v.get("message").and_then(|m| m.as_str()).unwrap_or("github rejected merge")
+                })
+            }
+        }
+        Err(e) => json!({ "status": "error", "error": format!("github unreachable: {}", e) }),
+    }
+}
+
+/// Append an audit record to the `odin-audit` index (best-effort).
+pub async fn audit_event(client: &Client, cfg: &AgentConfig, action: &str, details: Value) {
+    let url = format!("{}/odin-audit/_doc", cfg.tyr_indexer_url);
+    let mut body = json!({ "action": action, "actor": "odin" });
+    if let (Some(obj), Some(extra)) = (body.as_object_mut(), details.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let _ = client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&body)
+        .send()
+        .await;
+}
+
 /// POST JSON to a URL, optionally setting X-Tenant-Id header.
 async fn json_post(client: &Client, url: &str, body: &Value, tenant_id: Option<&str>) -> Result<Value> {
     let mut req = client.post(url).json(body);
@@ -561,6 +849,12 @@ pub fn tool_definitions() -> Value {
         // Ratatoskr — shared headless browser service
         tool("ratatoskr_health", "Ratatoskr (shared headless browser): service health + session pool status", json!({})),
 
+        // knowledge_search — Mimir RAG over the AI-security knowledge base
+        tool("knowledge_search", "Search the AI Security knowledge base (NCSA 'AI Security Guidelines' / แนวปฏิบัติการใช้ปัญญาประดิษฐ์อย่างมั่นคงปลอดภัย, stored in Mimir). Use this to ground answers about AI/LLM threats (Prompt Injection, Data/Model Poisoning, Model Extraction, AI supply-chain attacks), secure AI lifecycle, risk assessment, and recommended controls/best-practices. Returns the most relevant passages (Thai). Query in Thai or English.", json!({
+            "query": { "type": "string", "description": "natural-language question or keywords, e.g. 'การป้องกัน Prompt Injection' or 'AI supply chain attack controls'" },
+            "limit": { "type": "integer", "description": "max passages to return, default 5, max 10" }
+        })),
+
         // propose_github_issue — staged write (T2). Returns a proposal for the human to
         // confirm in the UI; does NOT create the issue itself. Use after triaging an
         // alert/finding when the user asks to file/track it.
@@ -568,6 +862,19 @@ pub fn tool_definitions() -> Value {
             "service": { "type": "string", "description": "service the issue is about, e.g. 'eir-gateway', 'mimir-api', 'tyr' — used to pick the repo" },
             "title": { "type": "string", "description": "concise issue title" },
             "body": { "type": "string", "description": "issue body in markdown (summary, evidence, remediation)" }
+        })),
+
+        // Phase 5 — GitHub PR review/merge (close the loop: issue→PR→review→merge)
+        tool("gh_pr_list", "List GitHub pull requests for a repo (e.g. the draft PRs Muninn opened). Read-only (T2).", json!({
+            "repo": { "type": "string", "description": "target repo as 'owner/repo', e.g. 'MegaWiz-Dev-Team/Muninn'" }
+        })),
+        tool("gh_pr_get", "Get one pull request's metadata + changed files (with diff patches) so you can review it before recommending a merge. Read-only (T2).", json!({
+            "repo": { "type": "string", "description": "'owner/repo'" },
+            "number": { "type": "integer", "description": "pull request number" }
+        })),
+        tool("propose_pr_merge", "Propose merging a pull request (does NOT merge — returns a proposal + review info the human confirms with a button). T3 prod write; merge only happens after the click via /api/pulls/merge.", json!({
+            "repo": { "type": "string", "description": "'owner/repo'" },
+            "number": { "type": "integer", "description": "pull request number to merge" }
         })),
     ])
 }

@@ -253,6 +253,13 @@ struct CreateIssueRequest {
     body: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MergePrRequest {
+    repo: String,                // "owner/repo"
+    number: u64,
+    method: Option<String>,      // merge | squash | rebase (default squash)
+}
+
 /// HITL confirm endpoint — the human clicked "Create" on a proposed issue.
 /// Dedups, creates the GitHub issue server-side (token never reaches the browser),
 /// records the fingerprint, and audits. This is the only place an issue is created.
@@ -292,6 +299,36 @@ async fn create_issue(
     }
 }
 
+/// HITL confirm endpoint (T3) — the human clicked "Merge" on a proposed PR merge.
+/// Merges server-side via the GitHub API and audits the action. This is the only
+/// place a PR is actually merged.
+async fn merge_pr(
+    State(state): State<ChatState>,
+    Json(req): Json<MergePrRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+
+    if cfg.github_token.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
+    }
+    let method = req.method.as_deref().unwrap_or("squash");
+    let outcome = crate::agents::merge_pr_core(&client, &cfg, &req.repo, req.number, method).await;
+
+    crate::agents::audit_event(&client, &cfg, "pr_merge", serde_json::json!({
+        "repo": req.repo, "number": req.number, "method": method,
+        "result": outcome.get("status"), "error": outcome.get("error"),
+    })).await;
+
+    let ok = outcome.get("status").and_then(|s| s.as_str()) == Some("merged");
+    if ok {
+        Json(outcome).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(outcome)).into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -313,6 +350,7 @@ async fn main() {
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/issues/create", post(create_issue))
+        .route("/api/pulls/merge", post(merge_pr))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));

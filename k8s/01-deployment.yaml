@@ -36,7 +36,10 @@ spec:
         - name: HEIMDALL_URL
           value: "http://host.docker.internal:8080"
         - name: HEIMDALL_MODEL
-          value: "claude-sonnet-4-6"
+          # Gemini 3.1 flash-lite via Heimdall's gemini/ provider routing.
+          # (claude-sonnet-4-6 routing via the gateway is currently broken —
+          # times out/502s.) Supports streaming + tool-calling.
+          value: "gemini/gemini-3.1-flash-lite"
         - name: TYR_URL
           value: "https://wazuh-manager.wazuh.svc.cluster.local:55000"
         - name: TYR_USER
@@ -59,6 +62,14 @@ spec:
           value: "http://forseti.asgard.svc.cluster.local:5555"
         - name: MJOLNIR_URL
           value: "http://mjolnir.asgard.svc.cluster.local:8700"
+        # Mimir — AI-security knowledge base (RAG)
+        - name: MIMIR_URL
+          value: "http://mimir-api.asgard.svc:8080"
+        - name: MIMIR_TENANT
+          value: "asgard_platform"
+        # NCSA AI Security Guidelines = data source id 3 in asgard_platform
+        - name: MIMIR_KB_SOURCE_IDS
+          value: "3"
         # Discord bot
         - name: DISCORD_CHANNEL_ID
           value: ""
