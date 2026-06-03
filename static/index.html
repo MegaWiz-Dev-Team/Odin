@@ -428,7 +428,7 @@
                     <label style="font-size:0.78rem;color:var(--text-muted);display:flex;align-items:center;gap:0.3rem;cursor:pointer">
                         <input type="checkbox" id="autoRefresh" checked onchange="toggleAuto()"> Auto (10s)
                     </label>
-                    <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">\u21bb Refresh</button>
+                    <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
                 </div>
             </div>
             <table class="issues-table" id="allIssuesTable">
@@ -524,6 +524,30 @@
             const h = extra || {};
             if (t) h['Authorization'] = 'Bearer ' + t;
             return h;
+        }
+
+        // Session-expiry guard: Odin issues a fresh bearer token on every restart,
+        // so a token from before a redeploy becomes invalid. Any /api 401 → clear the
+        // dead token and re-show login (instead of silently rendering everything Offline).
+        (function () {
+            const _fetch = window.fetch.bind(window);
+            window.fetch = async (url, opts) => {
+                const r = await _fetch(url, opts);
+                try {
+                    const u = typeof url === 'string' ? url : (url && url.url) || '';
+                    if (r.status === 401 && u.indexOf('/api/') !== -1 && u.indexOf('/api/auth/login') === -1) {
+                        sessionExpired();
+                    }
+                } catch (_) {}
+                return r;
+            };
+        })();
+        function sessionExpired() {
+            if (window.__odinSessionExpired) return;
+            window.__odinSessionExpired = true;
+            localStorage.removeItem('odin_token');
+            const ov = document.getElementById('loginOverlay');
+            if (ov) ov.style.display = 'flex';
         }
 
         // ── Service Registry — all Asgard services ─────────────────
@@ -966,6 +990,7 @@
                 if (!res.ok) throw new Error('Invalid credentials');
                 const data = await res.json();
                 localStorage.setItem('odin_token', data.token);
+                window.__odinSessionExpired = false;
                 document.getElementById('loginOverlay').style.display = 'none';
                 initDashboard();
             } catch (e) {
