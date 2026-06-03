@@ -3,8 +3,8 @@ mod bridge;
 mod chat;
 mod discord;
 mod findings;
+mod policy;
 mod report;
-mod thor;
 
 use axum::{
     extract::{Json, Request, State},
@@ -315,10 +315,11 @@ async fn merge_pr(
             Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
     }
 
-    // Thor v0 policy gate — evaluate the PR against merge policy BEFORE merging.
+    // Thor policy gate (Regorus/Rego, via the `thor` crate) — evaluate the PR
+    // against merge policy BEFORE merging.
     let pr = crate::agents::gh_pr_get(&client, &cfg, &req.repo, req.number).await;
-    let policy = crate::thor::ThorMergePolicy::from_env();
-    let verdict = crate::thor::check_merge(&policy, &pr);
+    let policy = crate::policy::MergePolicy::from_env();
+    let verdict = crate::policy::check_merge(&policy, &pr);
     if !verdict.allow {
         crate::agents::audit_event(&client, &cfg, "pr_merge_denied", serde_json::json!({
             "repo": req.repo, "number": req.number, "gate": "thor",

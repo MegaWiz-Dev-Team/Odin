@@ -3,8 +3,9 @@ FROM rust:latest AS builder
 
 WORKDIR /app
 
-# Cache dependencies
+# Cache dependencies (workspace root + the `thor` policy crate member)
 COPY Cargo.toml Cargo.lock ./
+COPY thor ./thor
 RUN mkdir src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release 2>/dev/null || true
 RUN rm -f target/release/deps/Odin* target/release/Odin

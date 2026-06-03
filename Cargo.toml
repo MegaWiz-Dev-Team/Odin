@@ -3,7 +3,11 @@ name = "Odin"
 version = "0.2.0"
 edition = "2024"
 
+[workspace]
+members = ["thor"]
+
 [dependencies]
+thor = { path = "thor" }
 axum = { version = "0.8", features = ["macros"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }

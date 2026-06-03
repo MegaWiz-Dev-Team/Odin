@@ -1,0 +1,10 @@
+[package]
+name = "thor"
+version = "0.1.0"
+edition = "2021"
+description = "Thor — Asgard policy enforcer. Embedded Rego (Regorus) policy engine that gates T3 write actions. Reusable across Odin / Loki / future services."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+regorus = "0.10"
+serde_json = "1"
