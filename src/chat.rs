@@ -249,13 +249,39 @@ pub async fn chat_handler(
                                 }
                                 if let Some(tc) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                     for call in tc {
-                                        let idx = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push((String::new(), String::new(), String::new(), None));
-                                        }
+                                        // Resolve which accumulator slot this delta belongs to.
+                                        // OpenAI/Claude split a single call's args across deltas keyed
+                                        // by a per-call `index`. Gemini-via-Heimdall omits that index
+                                        // and instead emits each PARALLEL call complete in its own
+                                        // delta with a fresh `id`. Defaulting a missing index to 0
+                                        // collapses every parallel call into slot 0 — the args then
+                                        // concatenate (e.g. "{}{}{}"), which is invalid JSON and makes
+                                        // Gemini reject the follow-up with 400 INVALID_ARGUMENT. So:
+                                        // index if present, else match/append by id, else continue last.
+                                        let id_opt = call.get("id").and_then(|s| s.as_str()).filter(|s| !s.is_empty());
+                                        let idx = if let Some(i) = call.get("index").and_then(|i| i.as_u64()) {
+                                            let i = i as usize;
+                                            while tool_calls.len() <= i {
+                                                tool_calls.push((String::new(), String::new(), String::new(), None));
+                                            }
+                                            i
+                                        } else if let Some(id) = id_opt {
+                                            match tool_calls.iter().position(|e| e.0 == id) {
+                                                Some(p) => p,
+                                                None => {
+                                                    tool_calls.push((id.to_string(), String::new(), String::new(), None));
+                                                    tool_calls.len() - 1
+                                                }
+                                            }
+                                        } else {
+                                            if tool_calls.is_empty() {
+                                                tool_calls.push((String::new(), String::new(), String::new(), None));
+                                            }
+                                            tool_calls.len() - 1
+                                        };
                                         let entry = &mut tool_calls[idx];
-                                        if let Some(id) = call.get("id").and_then(|s| s.as_str()) {
-                                            if !id.is_empty() { entry.0 = id.to_string(); }
+                                        if let Some(id) = id_opt {
+                                            if entry.0.is_empty() { entry.0 = id.to_string(); }
                                         }
                                         if let Some(ec) = call.get("extra_content") {
                                             if !ec.is_null() { entry.3 = Some(ec.clone()); }
