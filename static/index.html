@@ -1162,6 +1162,69 @@
             asst.appendChild(bar); ocMsgs.scrollTop = ocMsgs.scrollHeight;
         }
 
+        // Live progress bar for huginn_batch_scan: polls /api/huginn/batch-status
+        // (server aggregates per-scan status) until done, then shows a findings summary.
+        function ocShortTarget(t){ if(!t) return '?'; try { return (''+t).replace(/^https?:\/\//,'').split('.')[0].split(':')[0]; } catch { return ''+t; } }
+        function odinBatchProgress(result){
+            const ids = (result && result.scans) || [];
+            const wrap = document.createElement('div');
+            wrap.className = 'oc-batch';
+            wrap.style.cssText = 'margin:8px 0;padding:10px 12px;border:1px solid rgba(255,255,255,0.12);border-radius:8px;background:rgba(255,255,255,0.03)';
+            const title = document.createElement('div');
+            title.style.cssText = 'font-size:13px;font-weight:600;margin-bottom:6px';
+            title.textContent = '🔨 Batch scan (' + ids.length + ' scans)';
+            const barOuter = document.createElement('div');
+            barOuter.style.cssText = 'height:10px;border-radius:5px;background:rgba(255,255,255,0.08);overflow:hidden';
+            const barInner = document.createElement('div');
+            barInner.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .4s ease';
+            barOuter.appendChild(barInner);
+            const status = document.createElement('div');
+            status.style.cssText = 'font-size:12px;opacity:.85;margin-top:6px';
+            status.textContent = 'starting…';
+            wrap.appendChild(title); wrap.appendChild(barOuter); wrap.appendChild(status);
+
+            let tries = 0; const maxTries = 225; // ~15 min @ 4s
+            async function poll(){
+                tries++;
+                let d;
+                try {
+                    const r = await fetch('/api/huginn/batch-status', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ scans: ids }) });
+                    if(!r.ok) throw new Error('HTTP ' + r.status);
+                    d = await r.json();
+                } catch(e){
+                    status.textContent = 'progress unavailable: ' + e.message;
+                    if(tries < 5) setTimeout(poll, 4000);
+                    return;
+                }
+                barInner.style.width = (d.percent||0) + '%';
+                if(d.done){
+                    barInner.style.width = '100%';
+                    const sev = (d.findings>0) ? ('⚠️ ' + d.findings + ' findings') : '0 findings';
+                    status.textContent = '✅ ' + d.completed + '/' + d.total + ' done · ' + sev + (d.failed ? (' · ' + d.failed + ' failed') : '');
+                    const withF = (d.services||[]).filter(s => (s.finding_count||0) > 0);
+                    if(withF.length){
+                        const ul = document.createElement('div');
+                        ul.style.cssText = 'font-size:12px;margin-top:6px;opacity:.9';
+                        ul.innerHTML = withF.sort((a,b)=>(b.finding_count||0)-(a.finding_count||0)).slice(0,8)
+                            .map(s => '• ' + ocShortTarget(s.target) + ' — ' + s.finding_count + ' (' + (s.scan_type||'') + ')').join('<br>');
+                        wrap.appendChild(ul);
+                    }
+                    ocMsgs.scrollTop = ocMsgs.scrollHeight;
+                    return; // stop polling
+                }
+                const running = (d.services||[]).filter(s => s.status==='running').map(s => ocShortTarget(s.target));
+                let line = (d.completed + d.failed) + '/' + d.total + ' done';
+                if(d.failed) line += ' · ' + d.failed + ' failed';
+                if(running.length) line += ' · scanning: ' + running.slice(0,3).join(', ') + (running.length>3 ? '…' : '');
+                else if(d.pending) line += ' · ' + d.pending + ' queued';
+                status.textContent = line;
+                if(tries < maxTries) setTimeout(poll, 4000);
+                else status.textContent = line + ' (stopped polling — check Huginn)';
+            }
+            setTimeout(poll, 1500);
+            return wrap;
+        }
+
         async function odinSend(){
             if(ocBusy) return;
             const input = document.getElementById('ocInput'), text = input.value.trim();
@@ -1189,6 +1252,7 @@
                             if(ev.type==='delta'){ clearTyping(); acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='tool_call'){ clearTyping(); const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='tool_result' && ev.name==='propose_github_issue' && ev.result){ clearTyping(); asst.appendChild(odinIssueCard(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_result' && ev.name==='huginn_batch_scan' && ev.result && Array.isArray(ev.result.scans) && ev.result.scans.length){ clearTyping(); asst.appendChild(odinBatchProgress(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='error'){ body.innerHTML += '<div class="oc-err">'+ev.message+'</div>'; }
                         }
                     }

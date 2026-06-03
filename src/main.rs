@@ -196,6 +196,83 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct BatchStatusRequest {
+    scans: Vec<String>,
+}
+
+/// Aggregate Huginn batch progress. Given the scan ids returned by huginn_batch_scan,
+/// fetch Huginn's scan list once and tally status + findings for just those ids — so
+/// the chat can render a live progress bar without the browser polling N scans
+/// individually. batch_id isn't persisted on scans, so the id set is the grouping key.
+async fn huginn_batch_status(
+    State(state): State<ChatState>,
+    Json(req): Json<BatchStatusRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let want: std::collections::HashSet<String> = req.scans.into_iter().collect();
+    let total = want.len();
+
+    let list = client
+        .get(format!("{}/api/scans?limit=2000", cfg.huginn_url))
+        .send()
+        .await
+        .ok();
+    let scans: Vec<serde_json::Value> = match list {
+        Some(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .as_array()
+                .cloned()
+                .or_else(|| v.get("scans").and_then(|s| s.as_array()).cloned())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        },
+        None => vec![],
+    };
+
+    let (mut completed, mut failed, mut running, mut findings) = (0usize, 0usize, 0usize, 0u64);
+    let mut services: Vec<serde_json::Value> = Vec::new();
+    for s in &scans {
+        let id = s.get("scan_id").and_then(|x| x.as_str()).unwrap_or("");
+        if !want.contains(id) {
+            continue;
+        }
+        let status = s.get("status").and_then(|x| x.as_str()).unwrap_or("");
+        let fc = s.get("finding_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        findings += fc;
+        match status {
+            "completed" => completed += 1,
+            "failed" => failed += 1,
+            "running" => running += 1,
+            _ => {}
+        }
+        services.push(serde_json::json!({
+            "target": s.get("target"),
+            "scan_type": s.get("scan_type"),
+            "status": status,
+            "finding_count": fc,
+        }));
+    }
+    // Any requested id not yet present in the list is still queued (pending).
+    let known = completed + failed + running;
+    let pending = total.saturating_sub(known);
+    let percent = if total == 0 { 0 } else { ((completed + failed) * 100) / total };
+    let done = total > 0 && (completed + failed) >= total;
+
+    Json(serde_json::json!({
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": pending,
+        "findings": findings,
+        "percent": percent,
+        "done": done,
+        "services": services,
+    }))
+}
+
 /// Surface recent Thor/governance decisions (the `odin-audit` index) through Odin —
 /// pr_merge / pr_merge_denied, create / *_denied_by_thor, active_response(_denied),
 /// tyr_bridge_create_issue, etc. Server-side (browser/Tailscale can't reach the
@@ -472,6 +549,7 @@ async fn main() {
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))
         .route("/api/active-response", post(active_response))
+        .route("/api/huginn/batch-status", post(huginn_batch_status))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));
