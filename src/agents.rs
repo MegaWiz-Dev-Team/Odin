@@ -247,6 +247,21 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("open");
             Ok(gh_pr_list(&client, cfg, &repo, state).await)
         }
+        // List issues on ANY repo (read-only). Accepts 'owner/repo' or a bare
+        // service name ('mimir'); not restricted to Muninn's WATCHED_REPOS.
+        "gh_issue_list" => {
+            let raw = args.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+            let repo = if raw.contains('/') {
+                raw.to_string()
+            } else if !raw.is_empty() {
+                service_to_repo(&raw.to_lowercase())
+            } else {
+                resolve_repo(args)
+            };
+            let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("open");
+            let labels = args.get("labels").and_then(|v| v.as_str());
+            Ok(gh_issue_list(&client, cfg, &repo, state, labels).await)
+        }
         "gh_pr_get" => {
             let repo = resolve_repo(args);
             let number = args
@@ -812,6 +827,63 @@ pub async fn gh_pr_list(client: &Client, cfg: &AgentConfig, repo: &str, state: &
     json!({ "repo": repo, "count": prs.len(), "pulls": prs })
 }
 
+/// List issues for ANY repo (read-only, T2) — not limited to the repos Muninn
+/// watches. GitHub's /issues endpoint also returns PRs, so entries carrying a
+/// `pull_request` field are dropped. Use for on-demand triage of e.g. Mimir.
+pub async fn gh_issue_list(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    state: &str,
+    labels: Option<&str>,
+) -> Value {
+    let mut url = format!(
+        "{}/repos/{}/issues?state={}&per_page=30&sort=updated&direction=desc",
+        cfg.github_api_url, repo, state
+    );
+    if let Some(l) = labels.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&labels={}", l));
+    }
+    let v = github_get_authed(client, cfg, &url).await;
+    if v.get("error").is_some() {
+        return v;
+    }
+    let issues = v
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|p| p.get("pull_request").is_none()) // /issues returns PRs too — drop them
+                .map(|p| {
+                    let body = p.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                    let body_excerpt: String = body.chars().take(280).collect();
+                    let labels: Vec<&str> = p
+                        .get("labels")
+                        .and_then(|l| l.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.get("name").and_then(|n| n.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "number": p.get("number"),
+                        "title": p.get("title"),
+                        "state": p.get("state"),
+                        "user": p.pointer("/user/login"),
+                        "labels": labels,
+                        "comments": p.get("comments"),
+                        "url": p.get("html_url"),
+                        "created_at": p.get("created_at"),
+                        "updated_at": p.get("updated_at"),
+                        "body_excerpt": body_excerpt,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({ "repo": repo, "count": issues.len(), "issues": issues })
+}
+
 /// Get one PR: metadata + changed files with patches (for review). T2 read.
 pub async fn gh_pr_get(client: &Client, cfg: &AgentConfig, repo: &str, number: u64) -> Value {
     let meta = github_get_authed(
@@ -985,7 +1057,7 @@ pub fn tool_definitions() -> Value {
 
         // Muninn — Issue Watcher / Auto-Fixer
         tool("muninn_health", "Muninn (Issue Watcher): service health", json!({})),
-        tool("muninn_list_issues", "Muninn: list watched issues and their status", json!({})),
+        tool("muninn_list_issues", "Muninn: list only the issues Muninn is actively WATCHING for auto-fix (limited to the configured WATCHED_REPOS). To check issues on an arbitrary repo Muninn does not watch (e.g. Mimir), use gh_issue_list instead.", json!({})),
         tool("muninn_get_issue", "Muninn: detail for a single issue including remediation suggestions", json!({
             "issue_id": { "type": "string", "description": "issue id" }
         })),
@@ -1034,6 +1106,10 @@ pub fn tool_definitions() -> Value {
         })),
 
         // Phase 5 — GitHub PR review/merge (close the loop: issue→PR→review→merge)
+        tool("gh_issue_list", "List GitHub issues for ANY repo (read-only, T2) — including repos Muninn does NOT actively watch. Use this to check issues on a specific repo such as Mimir, Bifrost, Eir, Syn, Heimdall, etc. Pull requests are filtered out. Returns number, title, state, labels, author, comment count, and a body excerpt.", json!({
+            "repo": { "type": "string", "description": "'owner/repo' (e.g. 'MegaWiz-Dev-Team/Mimir') OR a short service name (e.g. 'mimir', 'bifrost', 'eir', 'syn', 'heimdall')" },
+            "state": { "type": "string", "description": "issue state: open | closed | all (default open)" }
+        })),
         tool("gh_pr_list", "List GitHub pull requests for a repo (e.g. the draft PRs Muninn opened). Read-only (T2).", json!({
             "repo": { "type": "string", "description": "target repo as 'owner/repo', e.g. 'MegaWiz-Dev-Team/Muninn'" }
         })),
