@@ -196,6 +196,42 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     }
 }
 
+/// Surface recent Thor/governance decisions (the `odin-audit` index) through Odin —
+/// pr_merge / pr_merge_denied, create / *_denied_by_thor, active_response(_denied),
+/// tyr_bridge_create_issue, etc. Server-side (browser/Tailscale can't reach the
+/// indexer). Fetches match_all and sorts newest-first in-process (rfc3339 `ts`
+/// sorts lexicographically) to avoid the indexer text/fielddata sort gotcha.
+async fn audit_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/odin-audit/_search", cfg.tyr_indexer_url);
+    let q = serde_json::json!({ "size": 100, "query": { "match_all": {} } });
+    let resp = client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&q)
+        .send()
+        .await;
+    let mut events: Vec<serde_json::Value> = match resp {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .pointer("/hits/hits")
+                .and_then(|h| h.as_array())
+                .map(|a| a.iter().filter_map(|h| h.get("_source").cloned()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        },
+        Err(_) => vec![],
+    };
+    events.sort_by(|a, b| {
+        let ta = a.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+        let tb = b.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+        tb.cmp(ta) // newest first
+    });
+    events.truncate(50);
+    Json(serde_json::json!({ "events": events }))
+}
+
 #[derive(Deserialize)]
 struct SaveReportRequest {
     title: Option<String>,
@@ -432,6 +468,7 @@ async fn main() {
         .route("/api/chat", post(chat::chat_handler))
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
+        .route("/api/audit", axum::routing::get(audit_proxy))
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))
         .route("/api/active-response", post(active_response))

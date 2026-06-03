@@ -828,7 +828,7 @@ pub async fn merge_pr_core(
 /// Append an audit record to the `odin-audit` index (best-effort).
 pub async fn audit_event(client: &Client, cfg: &AgentConfig, action: &str, details: Value) {
     let url = format!("{}/odin-audit/_doc", cfg.tyr_indexer_url);
-    let mut body = json!({ "action": action, "actor": "odin" });
+    let mut body = json!({ "action": action, "actor": "odin", "ts": chrono::Utc::now().to_rfc3339() });
     if let (Some(obj), Some(extra)) = (body.as_object_mut(), details.as_object()) {
         for (k, v) in extra {
             obj.insert(k.clone(), v.clone());
