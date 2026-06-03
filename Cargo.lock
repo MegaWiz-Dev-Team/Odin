@@ -2097,6 +2097,7 @@ dependencies = [
 [[package]]
 name = "thor"
 version = "0.1.0"
+source = "git+https://github.com/MegaWiz-Dev-Team/Thor?branch=main#e5c49dfcc1f1d435de117625ed6b4e9fb3cad42b"
 dependencies = [
  "regorus",
  "serde_json",
