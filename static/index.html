@@ -416,6 +416,7 @@
         <div class="tab" data-tab="fixed" id="tabFixed">✅ Fixed</div>
         <div class="tab" data-tab="loadtests" id="tabLoadtests">🔨 Load Tests</div>
         <div class="tab" data-tab="services" id="tabServices">🔌 Services</div>
+        <div class="tab" data-tab="audit" id="tabAudit">🔨 Policy / Audit</div>
     </div>
 
     <div class="content">
@@ -427,7 +428,7 @@
                     <label style="font-size:0.78rem;color:var(--text-muted);display:flex;align-items:center;gap:0.3rem;cursor:pointer">
                         <input type="checkbox" id="autoRefresh" checked onchange="toggleAuto()"> Auto (10s)
                     </label>
-                    <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">\u21bb Refresh</button>
+                    <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
                 </div>
             </div>
             <table class="issues-table" id="allIssuesTable">
@@ -497,6 +498,23 @@
         <div class="tab-content" id="contentServices">
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin-top:0.5rem" id="servicesGrid"></div>
         </div>
+
+        <!-- Policy / Audit Tab — Thor decisions + governance actions (odin-audit index) -->
+        <div class="tab-content" id="contentAudit">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+                <div style="font-size:0.8rem;color:var(--text-muted)">🔨 Thor policy decisions &amp; governance actions — merge / create / active-response / Týr bridge (newest first)</div>
+                <button class="btn btn-approve" onclick="fetchAudit()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
+            </div>
+            <table class="issues-table">
+                <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Decision</th><th>Detail</th></tr></thead>
+                <tbody id="auditBody"></tbody>
+            </table>
+            <div class="empty-state" id="emptyAudit" style="display:none">
+                <div class="icon">🔨</div>
+                <h3>No policy decisions yet</h3>
+                <p>Thor verdicts (allow/deny) and governance actions are recorded here as they happen.</p>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -506,6 +524,30 @@
             const h = extra || {};
             if (t) h['Authorization'] = 'Bearer ' + t;
             return h;
+        }
+
+        // Session-expiry guard: Odin issues a fresh bearer token on every restart,
+        // so a token from before a redeploy becomes invalid. Any /api 401 → clear the
+        // dead token and re-show login (instead of silently rendering everything Offline).
+        (function () {
+            const _fetch = window.fetch.bind(window);
+            window.fetch = async (url, opts) => {
+                const r = await _fetch(url, opts);
+                try {
+                    const u = typeof url === 'string' ? url : (url && url.url) || '';
+                    if (r.status === 401 && u.indexOf('/api/') !== -1 && u.indexOf('/api/auth/login') === -1) {
+                        sessionExpired();
+                    }
+                } catch (_) {}
+                return r;
+            };
+        })();
+        function sessionExpired() {
+            if (window.__odinSessionExpired) return;
+            window.__odinSessionExpired = true;
+            localStorage.removeItem('odin_token');
+            const ov = document.getElementById('loginOverlay');
+            if (ov) ov.style.display = 'flex';
         }
 
         // ── Service Registry — all Asgard services ─────────────────
@@ -579,9 +621,46 @@
                 document.getElementById('content' + key.charAt(0).toUpperCase() + key.slice(1)).classList.add('active');
                 if (key === 'services') fetchServices();
                 if (key === 'loadtests') fetchLoadTests();
+                if (key === 'audit') fetchAudit();
             });
         });
         function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+        // ── Policy / Audit feed (Thor verdicts + governance actions) ──
+        function escA(s){ return String(s==null?'':s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+        async function fetchAudit() {
+            const body = document.getElementById('auditBody');
+            const empty = document.getElementById('emptyAudit');
+            body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">Loading…</td></tr>';
+            try {
+                const res = await fetch('/api/audit', { headers: odinAuthHeaders() });
+                const ev = (await res.json()).events || [];
+                if (!ev.length) { body.innerHTML = ''; empty.style.display = 'block'; return; }
+                empty.style.display = 'none';
+                body.innerHTML = ev.map(e => {
+                    const action = e.action || '?';
+                    const denied = /denied/.test(action);
+                    const agents = Array.isArray(e.agents) ? e.agents.join(',') : (e.agents || '');
+                    const target = e.repo ? (escA(e.repo) + (e.number ? ('#' + e.number) : ''))
+                        : e.command ? ('AR <code>' + escA(e.command) + '</code>' + (agents ? (' → ' + escA(agents)) : ''))
+                        : escA(e.title || '—');
+                    const decision = denied
+                        ? '<span style="color:var(--danger);font-weight:600">⛔ DENY</span>'
+                        : '<span style="color:var(--mint-dark);font-weight:600">✓ allow</span>';
+                    const detail = (e.violations && e.violations.length) ? escA(e.violations.join('; '))
+                        : (e.warnings && e.warnings.length) ? '⚠ ' + escA(e.warnings.join('; '))
+                        : (e.thor_warnings && e.thor_warnings.length) ? '⚠ ' + escA(e.thor_warnings.join('; '))
+                        : (e.result ? escA(typeof e.result === 'string' ? e.result : JSON.stringify(e.result)) : '');
+                    const ts = (e.ts || '').replace('T', ' ').slice(0, 19);
+                    return `<tr><td style="white-space:nowrap;color:var(--text-muted);font-size:.75rem">${ts}</td>`
+                        + `<td><code style="font-size:.75rem">${escA(action)}</code></td>`
+                        + `<td style="font-size:.82rem">${target}</td><td>${decision}</td>`
+                        + `<td style="color:var(--text-muted);font-size:.78rem">${detail}</td></tr>`;
+                }).join('');
+            } catch (err) {
+                body.innerHTML = `<tr><td colspan="5" style="color:var(--danger)">${escA(err.message)}</td></tr>`;
+            }
+        }
 
         // ── Fetch config ──
         async function fetchConfig() {
@@ -911,6 +990,7 @@
                 if (!res.ok) throw new Error('Invalid credentials');
                 const data = await res.json();
                 localStorage.setItem('odin_token', data.token);
+                window.__odinSessionExpired = false;
                 document.getElementById('loginOverlay').style.display = 'none';
                 initDashboard();
             } catch (e) {
@@ -1082,6 +1162,69 @@
             asst.appendChild(bar); ocMsgs.scrollTop = ocMsgs.scrollHeight;
         }
 
+        // Live progress bar for huginn_batch_scan: polls /api/huginn/batch-status
+        // (server aggregates per-scan status) until done, then shows a findings summary.
+        function ocShortTarget(t){ if(!t) return '?'; try { return (''+t).replace(/^https?:\/\//,'').split('.')[0].split(':')[0]; } catch { return ''+t; } }
+        function odinBatchProgress(result){
+            const ids = (result && result.scans) || [];
+            const wrap = document.createElement('div');
+            wrap.className = 'oc-batch';
+            wrap.style.cssText = 'margin:8px 0;padding:10px 12px;border:1px solid rgba(255,255,255,0.12);border-radius:8px;background:rgba(255,255,255,0.03)';
+            const title = document.createElement('div');
+            title.style.cssText = 'font-size:13px;font-weight:600;margin-bottom:6px';
+            title.textContent = '🔨 Batch scan (' + ids.length + ' scans)';
+            const barOuter = document.createElement('div');
+            barOuter.style.cssText = 'height:10px;border-radius:5px;background:rgba(255,255,255,0.08);overflow:hidden';
+            const barInner = document.createElement('div');
+            barInner.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .4s ease';
+            barOuter.appendChild(barInner);
+            const status = document.createElement('div');
+            status.style.cssText = 'font-size:12px;opacity:.85;margin-top:6px';
+            status.textContent = 'starting…';
+            wrap.appendChild(title); wrap.appendChild(barOuter); wrap.appendChild(status);
+
+            let tries = 0; const maxTries = 225; // ~15 min @ 4s
+            async function poll(){
+                tries++;
+                let d;
+                try {
+                    const r = await fetch('/api/huginn/batch-status', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ scans: ids }) });
+                    if(!r.ok) throw new Error('HTTP ' + r.status);
+                    d = await r.json();
+                } catch(e){
+                    status.textContent = 'progress unavailable: ' + e.message;
+                    if(tries < 5) setTimeout(poll, 4000);
+                    return;
+                }
+                barInner.style.width = (d.percent||0) + '%';
+                if(d.done){
+                    barInner.style.width = '100%';
+                    const sev = (d.findings>0) ? ('⚠️ ' + d.findings + ' findings') : '0 findings';
+                    status.textContent = '✅ ' + d.completed + '/' + d.total + ' done · ' + sev + (d.failed ? (' · ' + d.failed + ' failed') : '');
+                    const withF = (d.services||[]).filter(s => (s.finding_count||0) > 0);
+                    if(withF.length){
+                        const ul = document.createElement('div');
+                        ul.style.cssText = 'font-size:12px;margin-top:6px;opacity:.9';
+                        ul.innerHTML = withF.sort((a,b)=>(b.finding_count||0)-(a.finding_count||0)).slice(0,8)
+                            .map(s => '• ' + ocShortTarget(s.target) + ' — ' + s.finding_count + ' (' + (s.scan_type||'') + ')').join('<br>');
+                        wrap.appendChild(ul);
+                    }
+                    ocMsgs.scrollTop = ocMsgs.scrollHeight;
+                    return; // stop polling
+                }
+                const running = (d.services||[]).filter(s => s.status==='running').map(s => ocShortTarget(s.target));
+                let line = (d.completed + d.failed) + '/' + d.total + ' done';
+                if(d.failed) line += ' · ' + d.failed + ' failed';
+                if(running.length) line += ' · scanning: ' + running.slice(0,3).join(', ') + (running.length>3 ? '…' : '');
+                else if(d.pending) line += ' · ' + d.pending + ' queued';
+                status.textContent = line;
+                if(tries < maxTries) setTimeout(poll, 4000);
+                else status.textContent = line + ' (stopped polling — check Huginn)';
+            }
+            setTimeout(poll, 1500);
+            return wrap;
+        }
+
         async function odinSend(){
             if(ocBusy) return;
             const input = document.getElementById('ocInput'), text = input.value.trim();
@@ -1109,6 +1252,7 @@
                             if(ev.type==='delta'){ clearTyping(); acc += ev.content; body.innerHTML = marked.parse(acc); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='tool_call'){ clearTyping(); const t = document.createElement('div'); t.className='oc-tool'; t.textContent='🔧 '+ev.name+'('+JSON.stringify(ev.args)+')'; asst.appendChild(t); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='tool_result' && ev.name==='propose_github_issue' && ev.result){ clearTyping(); asst.appendChild(odinIssueCard(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
+                            else if(ev.type==='tool_result' && ev.name==='huginn_batch_scan' && ev.result && Array.isArray(ev.result.scans) && ev.result.scans.length){ clearTyping(); asst.appendChild(odinBatchProgress(ev.result)); ocMsgs.scrollTop = ocMsgs.scrollHeight; }
                             else if(ev.type==='error'){ body.innerHTML += '<div class="oc-err">'+ev.message+'</div>'; }
                         }
                     }

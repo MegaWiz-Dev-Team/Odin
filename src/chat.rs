@@ -20,9 +20,12 @@ You monitor and investigate infrastructure, security, and reliability via read-o
 - **Týr** (Wazuh SIEM): security alerts, agent health, rule listing, attack detection\n\
 - **Várðr** (Monitoring): service health, metrics, alert management, capacity planning\n\
 - **Huginn** (Security Scanner): vulnerability findings, security posture assessment\n\
-- **Muninn** (Issue Watcher): tracked issues, remediation suggestions\n\
+- **Muninn** (Issue Watcher): issues Muninn actively watches for auto-fix (only the configured repos)\n\
 - **Forseti** (E2E Testing): test run results, regression detection, trend analysis\n\
-- **Mjölnir** (Load Testing): HTTP load test results, latency, throughput, error rates\n\n\
+- **Mjölnir** (Load Testing): HTTP load test results, latency, throughput, error rates\n\
+- **GitHub**: read issues/PRs on ANY Asgard repo on demand — use `gh_issue_list` (issues) or `gh_pr_list` (PRs) with an 'owner/repo' or a short service name (e.g. 'mimir'). This is NOT limited to the repos Muninn watches, so use it whenever asked to check a specific repo like Mimir.\n\n\
+**Knowledge Base (Mimir RAG):**\n\
+- Use the **knowledge_search** tool to consult the NCSA *AI Security Guidelines* (แนวปฏิบัติการใช้ปัญญาประดิษฐ์อย่างมั่นคงปลอดภัย) when answering questions about AI/LLM-specific threats (Prompt Injection, Data/Model Poisoning, Model Extraction, AI supply-chain attacks), secure AI lifecycle, AI risk assessment, and recommended security controls. Ground such answers in retrieved passages and cite that the guidance comes from the NCSA AI Security Guidelines.\n\n\
 **For Medical/Patient Chat:**\n\
 Odin does not handle patient data or medical workflows. Direct users to the **Eir assistant** (integrated inside OpenEMR) for clinical questions, patient chart access, and medical document review.\n\n\
 **FORMATTING RULES:**\n\
@@ -94,7 +97,11 @@ pub async fn run_agent(
             .and_then(|fr| fr.as_str())
             .unwrap_or("");
 
-        if tool_calls.is_empty() || finish_reason != "tool_calls" {
+        // Run tools whenever the model emitted any. Providers disagree on
+        // finish_reason: Claude → "tool_calls", Gemini (via Heimdall) → "stop"
+        // even with tool calls present, so we key off tool_calls, not the reason.
+        let _ = finish_reason;
+        if tool_calls.is_empty() {
             return Ok((assistant_text, messages));
         }
 
@@ -204,8 +211,11 @@ pub async fn chat_handler(
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut assistant_text = String::new();
-            // tool_calls accumulated by index across deltas: (id, name, args_json_string)
-            let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+            // tool_calls accumulated by index across deltas:
+            // (id, name, args_json_string, extra_content). extra_content carries
+            // provider-specific data (e.g. Gemini's thought_signature) that MUST
+            // be replayed on the assistant message or Gemini rejects the follow-up.
+            let mut tool_calls: Vec<(String, String, String, Option<Value>)> = Vec::new();
             let mut finish_reason = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
@@ -240,13 +250,42 @@ pub async fn chat_handler(
                                 }
                                 if let Some(tc) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                     for call in tc {
-                                        let idx = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push((String::new(), String::new(), String::new()));
-                                        }
+                                        // Resolve which accumulator slot this delta belongs to.
+                                        // OpenAI/Claude split a single call's args across deltas keyed
+                                        // by a per-call `index`. Gemini-via-Heimdall omits that index
+                                        // and instead emits each PARALLEL call complete in its own
+                                        // delta with a fresh `id`. Defaulting a missing index to 0
+                                        // collapses every parallel call into slot 0 — the args then
+                                        // concatenate (e.g. "{}{}{}"), which is invalid JSON and makes
+                                        // Gemini reject the follow-up with 400 INVALID_ARGUMENT. So:
+                                        // index if present, else match/append by id, else continue last.
+                                        let id_opt = call.get("id").and_then(|s| s.as_str()).filter(|s| !s.is_empty());
+                                        let idx = if let Some(i) = call.get("index").and_then(|i| i.as_u64()) {
+                                            let i = i as usize;
+                                            while tool_calls.len() <= i {
+                                                tool_calls.push((String::new(), String::new(), String::new(), None));
+                                            }
+                                            i
+                                        } else if let Some(id) = id_opt {
+                                            match tool_calls.iter().position(|e| e.0 == id) {
+                                                Some(p) => p,
+                                                None => {
+                                                    tool_calls.push((id.to_string(), String::new(), String::new(), None));
+                                                    tool_calls.len() - 1
+                                                }
+                                            }
+                                        } else {
+                                            if tool_calls.is_empty() {
+                                                tool_calls.push((String::new(), String::new(), String::new(), None));
+                                            }
+                                            tool_calls.len() - 1
+                                        };
                                         let entry = &mut tool_calls[idx];
-                                        if let Some(id) = call.get("id").and_then(|s| s.as_str()) {
-                                            if !id.is_empty() { entry.0 = id.to_string(); }
+                                        if let Some(id) = id_opt {
+                                            if entry.0.is_empty() { entry.0 = id.to_string(); }
+                                        }
+                                        if let Some(ec) = call.get("extra_content") {
+                                            if !ec.is_null() { entry.3 = Some(ec.clone()); }
                                         }
                                         if let Some(func) = call.get("function") {
                                             if let Some(n) = func.get("name").and_then(|s| s.as_str()) {
@@ -267,7 +306,12 @@ pub async fn chat_handler(
                 }
             }
 
-            if tool_calls.is_empty() || finish_reason != "tool_calls" {
+            // Run tools whenever the model emitted any. Providers disagree on
+            // finish_reason: Claude → "tool_calls", Gemini (via Heimdall) → "stop"
+            // even with tool calls present, so key off the accumulated calls.
+            let _ = &finish_reason;
+            let has_tool_calls = tool_calls.iter().any(|(_, name, _, _)| !name.is_empty());
+            if !has_tool_calls {
                 yield sse_json(&json!({"type":"done"}));
                 return;
             }
@@ -276,15 +320,23 @@ pub async fn chat_handler(
             let assistant_msg = json!({
                 "role": "assistant",
                 "content": if assistant_text.is_empty() { Value::Null } else { Value::String(assistant_text.clone()) },
-                "tool_calls": tool_calls.iter().map(|(id, name, args)| json!({
-                    "id": id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": args }
-                })).collect::<Vec<_>>(),
+                "tool_calls": tool_calls.iter().map(|(id, name, args, extra)| {
+                    let mut tc = json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args }
+                    });
+                    // Replay provider extras (Gemini thought_signature) on the
+                    // assistant message, or the follow-up request is rejected.
+                    if let Some(ec) = extra {
+                        tc["extra_content"] = ec.clone();
+                    }
+                    tc
+                }).collect::<Vec<_>>(),
             });
             messages.push(assistant_msg);
 
-            for (id, name, args_str) in tool_calls.iter() {
+            for (id, name, args_str, _) in tool_calls.iter() {
                 let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
                 yield sse_json(&json!({"type":"tool_call","name":name,"args":args}));
                 let result = match dispatch_tool(&cfg, name, &args).await {

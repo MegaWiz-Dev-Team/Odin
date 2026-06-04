@@ -1,7 +1,9 @@
 mod agents;
+mod bridge;
 mod chat;
 mod discord;
 mod findings;
+mod policy;
 mod report;
 
 use axum::{
@@ -195,6 +197,119 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
+struct BatchStatusRequest {
+    scans: Vec<String>,
+}
+
+/// Aggregate Huginn batch progress. Given the scan ids returned by huginn_batch_scan,
+/// fetch Huginn's scan list once and tally status + findings for just those ids — so
+/// the chat can render a live progress bar without the browser polling N scans
+/// individually. batch_id isn't persisted on scans, so the id set is the grouping key.
+async fn huginn_batch_status(
+    State(state): State<ChatState>,
+    Json(req): Json<BatchStatusRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let want: std::collections::HashSet<String> = req.scans.into_iter().collect();
+    let total = want.len();
+
+    let list = client
+        .get(format!("{}/api/scans?limit=2000", cfg.huginn_url))
+        .send()
+        .await
+        .ok();
+    let scans: Vec<serde_json::Value> = match list {
+        Some(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .as_array()
+                .cloned()
+                .or_else(|| v.get("scans").and_then(|s| s.as_array()).cloned())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        },
+        None => vec![],
+    };
+
+    let (mut completed, mut failed, mut running, mut findings) = (0usize, 0usize, 0usize, 0u64);
+    let mut services: Vec<serde_json::Value> = Vec::new();
+    for s in &scans {
+        let id = s.get("scan_id").and_then(|x| x.as_str()).unwrap_or("");
+        if !want.contains(id) {
+            continue;
+        }
+        let status = s.get("status").and_then(|x| x.as_str()).unwrap_or("");
+        let fc = s.get("finding_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        findings += fc;
+        match status {
+            "completed" => completed += 1,
+            "failed" => failed += 1,
+            "running" => running += 1,
+            _ => {}
+        }
+        services.push(serde_json::json!({
+            "target": s.get("target"),
+            "scan_type": s.get("scan_type"),
+            "status": status,
+            "finding_count": fc,
+        }));
+    }
+    // Any requested id not yet present in the list is still queued (pending).
+    let known = completed + failed + running;
+    let pending = total.saturating_sub(known);
+    let percent = if total == 0 { 0 } else { ((completed + failed) * 100) / total };
+    let done = total > 0 && (completed + failed) >= total;
+
+    Json(serde_json::json!({
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": pending,
+        "findings": findings,
+        "percent": percent,
+        "done": done,
+        "services": services,
+    }))
+}
+
+/// Surface recent Thor/governance decisions (the `odin-audit` index) through Odin —
+/// pr_merge / pr_merge_denied, create / *_denied_by_thor, active_response(_denied),
+/// tyr_bridge_create_issue, etc. Server-side (browser/Tailscale can't reach the
+/// indexer). Fetches match_all and sorts newest-first in-process (rfc3339 `ts`
+/// sorts lexicographically) to avoid the indexer text/fielddata sort gotcha.
+async fn audit_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/odin-audit/_search", cfg.tyr_indexer_url);
+    let q = serde_json::json!({ "size": 100, "query": { "match_all": {} } });
+    let resp = client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&q)
+        .send()
+        .await;
+    let mut events: Vec<serde_json::Value> = match resp {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .pointer("/hits/hits")
+                .and_then(|h| h.as_array())
+                .map(|a| a.iter().filter_map(|h| h.get("_source").cloned()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        },
+        Err(_) => vec![],
+    };
+    events.sort_by(|a, b| {
+        let ta = a.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+        let tb = b.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+        tb.cmp(ta) // newest first
+    });
+    events.truncate(50);
+    Json(serde_json::json!({ "events": events }))
+}
+
+#[derive(Deserialize)]
 struct SaveReportRequest {
     title: Option<String>,
     content: String,
@@ -252,6 +367,21 @@ struct CreateIssueRequest {
     body: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MergePrRequest {
+    repo: String,                // "owner/repo"
+    number: u64,
+    method: Option<String>,      // merge | squash | rebase (default squash)
+}
+
+#[derive(Deserialize)]
+struct ActiveResponseRequest {
+    command: String,
+    agents: Vec<String>,
+    #[serde(default)]
+    arguments: Vec<String>,
+}
+
 /// HITL confirm endpoint — the human clicked "Create" on a proposed issue.
 /// Dedups, creates the GitHub issue server-side (token never reaches the browser),
 /// records the fingerprint, and audits. This is the only place an issue is created.
@@ -262,56 +392,136 @@ async fn create_issue(
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
 
-    let token = match &cfg.github_token {
-        Some(t) => t.clone(),
-        None => return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response(),
-    };
+    // Preserve the explicit 503 contract: no token → service unavailable (propose
+    // still works; create is blocked — safe default).
+    if cfg.github_token.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
+    }
     let repo = req.repo.clone().unwrap_or_else(|| {
         crate::agents::service_to_repo(req.service.as_deref().unwrap_or(""))
     });
-    let fp = crate::agents::issue_fingerprint(&repo, &req.title);
+    let body = req.body.clone().unwrap_or_default();
 
-    // Dedup: if already filed, return the existing issue instead of a duplicate.
-    if let Some(url) = crate::agents::dedup_lookup(&client, &cfg, &fp).await {
+    let outcome = crate::agents::create_issue_core(
+        &client, &cfg, &repo, &req.title, &body, &["odin", "auto-triage"],
+    ).await;
+
+    match outcome.status {
+        "created" | "duplicate" => Json(serde_json::json!({
+            "status": outcome.status,
+            "issue_url": outcome.issue_url,
+            "repo": outcome.repo,
+            "fingerprint": outcome.fingerprint,
+        })).into_response(),
+        "denied" => (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "error": outcome.error.unwrap_or_else(|| "denied by policy".into()),
+            "repo": outcome.repo,
+        }))).into_response(),
+        _ => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": outcome.error.unwrap_or_else(|| "github error".into()),
+            "repo": outcome.repo,
+        }))).into_response(),
+    }
+}
+
+/// HITL confirm endpoint (T3) — the human clicked "Merge" on a proposed PR merge.
+/// Merges server-side via the GitHub API and audits the action. This is the only
+/// place a PR is actually merged.
+async fn merge_pr(
+    State(state): State<ChatState>,
+    Json(req): Json<MergePrRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+
+    if cfg.github_token.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "GITHUB_TOKEN not configured on Odin"}))).into_response();
+    }
+
+    // Thor policy gate (Regorus/Rego, via the `thor` crate) — evaluate the PR
+    // against merge policy BEFORE merging.
+    let pr = crate::agents::gh_pr_get(&client, &cfg, &req.repo, req.number).await;
+    let policy = crate::policy::MergePolicy::from_env();
+    let verdict = crate::policy::check_merge(&policy, &pr);
+    if !verdict.allow {
+        crate::agents::audit_event(&client, &cfg, "pr_merge_denied", serde_json::json!({
+            "repo": req.repo, "number": req.number, "gate": "thor",
+            "violations": verdict.violations, "warnings": verdict.warnings,
+        })).await;
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "violations": verdict.violations,
+            "warnings": verdict.warnings,
+        }))).into_response();
+    }
+    if policy.dry_run {
+        crate::agents::audit_event(&client, &cfg, "pr_merge_dry_run", serde_json::json!({
+            "repo": req.repo, "number": req.number, "gate": "thor", "warnings": verdict.warnings,
+        })).await;
         return Json(serde_json::json!({
-            "status": "duplicate", "issue_url": url, "repo": repo, "fingerprint": fp
+            "status": "dry_run", "would_merge": true,
+            "repo": req.repo, "number": req.number, "warnings": verdict.warnings,
         })).into_response();
     }
 
-    let url = format!("{}/repos/{}/issues", cfg.github_api_url, repo);
-    let payload = serde_json::json!({
-        "title": req.title,
-        "body": req.body.clone().unwrap_or_default(),
-        "labels": ["odin", "auto-triage"],
-    });
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "odin-orchestrator")
-        .json(&payload)
-        .send()
-        .await;
+    let method = req.method.as_deref().unwrap_or("squash");
+    let outcome = crate::agents::merge_pr_core(&client, &cfg, &req.repo, req.number, method).await;
 
-    match resp {
-        Ok(r) => {
-            let ok = r.status().is_success();
-            let v: serde_json::Value = r.json().await.unwrap_or_default();
-            if ok {
-                let issue_url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
-                crate::agents::dedup_record(&client, &cfg, &fp, &repo, &req.title, issue_url).await;
-                Json(serde_json::json!({
-                    "status": "created", "issue_url": issue_url, "repo": repo, "fingerprint": fp
-                })).into_response()
-            } else {
-                (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                    "error": "github rejected", "detail": v.get("message"), "repo": repo
-                }))).into_response()
-            }
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("github unreachable: {}", e)}))).into_response(),
+    crate::agents::audit_event(&client, &cfg, "pr_merge", serde_json::json!({
+        "repo": req.repo, "number": req.number, "method": method,
+        "result": outcome.get("status"), "error": outcome.get("error"),
+        "thor_warnings": verdict.warnings,
+    })).await;
+
+    let ok = outcome.get("status").and_then(|s| s.as_str()) == Some("merged");
+    if ok {
+        Json(outcome).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(outcome)).into_response()
+    }
+}
+
+/// HITL confirm endpoint (T3) — send a Wazuh Active Response after a human clicks.
+/// Thor-gated (command allowlist + agent-target policy), then dispatched to the
+/// Wazuh manager API, and audited. The enforcement counterpart to Odin's read tools.
+async fn active_response(
+    State(state): State<ChatState>,
+    Json(req): Json<ActiveResponseRequest>,
+) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+
+    // Thor policy gate
+    let policy = crate::policy::ActiveResponsePolicy::from_env();
+    let verdict = crate::policy::check_active_response(&policy, &req.command, &req.agents);
+    if !verdict.allow {
+        crate::agents::audit_event(&client, &cfg, "active_response_denied", serde_json::json!({
+            "command": req.command, "agents": req.agents, "gate": "thor",
+            "violations": verdict.violations, "warnings": verdict.warnings,
+        })).await;
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "denied_by_thor",
+            "violations": verdict.violations,
+            "warnings": verdict.warnings,
+        }))).into_response();
+    }
+
+    let outcome = crate::agents::active_response_core(
+        &client, &cfg, &req.command, &req.agents, &req.arguments,
+    ).await;
+    crate::agents::audit_event(&client, &cfg, "active_response", serde_json::json!({
+        "command": req.command, "agents": req.agents,
+        "result": outcome.get("status"), "thor_warnings": verdict.warnings,
+    })).await;
+
+    let ok = outcome.get("status").and_then(|s| s.as_str()) == Some("sent");
+    if ok {
+        Json(outcome).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(outcome)).into_response()
     }
 }
 
@@ -335,7 +545,11 @@ async fn main() {
         .route("/api/chat", post(chat::chat_handler))
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
+        .route("/api/audit", axum::routing::get(audit_proxy))
         .route("/api/issues/create", post(create_issue))
+        .route("/api/pulls/merge", post(merge_pr))
+        .route("/api/active-response", post(active_response))
+        .route("/api/huginn/batch-status", post(huginn_batch_status))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .layer(middleware::from_fn(require_auth));
@@ -355,6 +569,12 @@ async fn main() {
     let discord_cfg = cfg.clone();
     tokio::spawn(async move {
         discord::start_bot(discord_cfg).await;
+    });
+
+    // Spawn Týr alert→issue bridge (no-op unless TYR_AUTO_BRIDGE=true)
+    let bridge_cfg = cfg.clone();
+    tokio::spawn(async move {
+        bridge::start_alert_bridge(bridge_cfg).await;
     });
 
     // Run our app

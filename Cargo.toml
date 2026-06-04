@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+thor = { git = "https://github.com/MegaWiz-Dev-Team/Thor", branch = "main" }
 axum = { version = "0.8", features = ["macros"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }

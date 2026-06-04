@@ -23,6 +23,10 @@ pub struct AgentConfig {
     pub loki_url: String,
     pub ratatoskr_url: String,
     pub laminar_url: String,
+    // Mimir — RAG knowledge base (Odin's AI-security KB, e.g. NCSA AI Security Guidelines)
+    pub mimir_url: String,
+    pub mimir_tenant: String,
+    pub mimir_kb_source_ids: Vec<i64>,
     pub github_token: Option<String>,
     pub github_api_url: String,
     pub discord_token: Option<String>,
@@ -36,7 +40,10 @@ impl AgentConfig {
             heimdall_url: env::var("HEIMDALL_URL")
                 .unwrap_or_else(|_| "http://host.docker.internal:8080".into()),
             heimdall_model: env::var("HEIMDALL_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+                // Default to Gemini 3.1 flash-lite via Heimdall's gemini/ routing.
+                // claude-sonnet-4-6 routing through the gateway is currently broken
+                // (HTTP 000 / times out), so it is not a safe fallback.
+                .unwrap_or_else(|_| "gemini/gemini-3.1-flash-lite".into()),
             heimdall_api_key: env::var("HEIMDALL_API_KEY").ok(),
             tyr_url: env::var("TYR_URL")
                 .unwrap_or_else(|_| "https://wazuh-manager.wazuh.svc.cluster.local:55000".into()),
@@ -62,6 +69,16 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "http://ratatoskr.asgard.svc.cluster.local:9200".into()),
             laminar_url: env::var("LAMINAR_URL")
                 .unwrap_or_else(|_| "http://laminar-app-server.asgard.svc.cluster.local:8000".into()),
+            mimir_url: env::var("MIMIR_URL")
+                .unwrap_or_else(|_| "http://mimir-api.asgard.svc:8080".into()),
+            mimir_tenant: env::var("MIMIR_TENANT").unwrap_or_else(|_| "asgard_platform".into()),
+            // Optional comma-separated data-source IDs to scope KB search to (e.g. "3" =
+            // NCSA AI Security Guidelines). Empty = search the whole tenant KB.
+            mimir_kb_source_ids: env::var("MIMIR_KB_SOURCE_IDS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i64>().ok())
+                .collect(),
             github_token: env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()),
             github_api_url: env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".into()),
@@ -102,6 +119,23 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
             tyr_search_alerts(&client, cfg, q, size).await
         }
+        // SCA — CIS-benchmark / hardening findings (alerts tagged rule.groups:sca)
+        "tyr_sca_results" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+            tyr_search_alerts(&client, cfg, "rule.groups:sca", size).await
+        }
+        // Rootcheck — rootkit / policy / anomaly findings
+        "tyr_rootcheck" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+            tyr_search_alerts(&client, cfg, "rule.groups:rootcheck", size).await
+        }
+        // Vulnerability inventory — CVEs per agent (Wazuh vuln-detection state index)
+        "tyr_vuln_inventory" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(30).min(100);
+            tyr_vuln_inventory(&client, cfg, size).await
+        }
+        // MITRE ATT&CK — top techniques seen across recent alerts
+        "tyr_mitre_summary" => tyr_mitre_summary(&client, cfg).await,
 
         "vardr_health" => json_get(&client, &format!("{}/health", cfg.vardr_url)).await,
         "vardr_list_services" => json_get(&client, &format!("{}/api/services", cfg.vardr_url)).await,
@@ -200,12 +234,146 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             }))
         }
 
+        // Mimir — query the AI-security knowledge base (RAG)
+        "knowledge_search" => {
+            let query = arg_str(args, "query")?;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).min(10);
+            knowledge_search(&client, cfg, &query, limit).await
+        }
+
+        // Phase 5 — GitHub PR review/merge
+        "gh_pr_list" => {
+            let repo = resolve_repo(args);
+            let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("open");
+            Ok(gh_pr_list(&client, cfg, &repo, state).await)
+        }
+        // List issues on ANY repo (read-only). Accepts 'owner/repo' or a bare
+        // service name ('mimir'); not restricted to Muninn's WATCHED_REPOS.
+        "gh_issue_list" => {
+            let raw = args.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+            let repo = if raw.contains('/') {
+                raw.to_string()
+            } else if !raw.is_empty() {
+                service_to_repo(&raw.to_lowercase())
+            } else {
+                resolve_repo(args)
+            };
+            let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("open");
+            let labels = args.get("labels").and_then(|v| v.as_str());
+            Ok(gh_issue_list(&client, cfg, &repo, state, labels).await)
+        }
+        "gh_pr_get" => {
+            let repo = resolve_repo(args);
+            let number = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("missing arg: number"))?;
+            Ok(gh_pr_get(&client, cfg, &repo, number).await)
+        }
+        // propose_pr_merge — READ-ONLY proposal (T3 gated). Returns PR review info +
+        // needs_confirmation; the actual merge happens via POST /api/pulls/merge after a click.
+        "propose_pr_merge" => {
+            let repo = resolve_repo(args);
+            let number = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("missing arg: number"))?;
+            let pr = gh_pr_get(&client, cfg, &repo, number).await;
+            Ok(json!({
+                "action": "propose_pr_merge",
+                "repo": repo,
+                "number": number,
+                "title": pr.get("title"),
+                "draft": pr.get("draft"),
+                "mergeable": pr.get("mergeable"),
+                "mergeable_state": pr.get("mergeable_state"),
+                "base": pr.get("base"),
+                "url": pr.get("url"),
+                "needs_confirmation": true,
+                "tier": "T3",
+                "note": "Proposal only — confirm in the UI to merge (T3 prod write). Draft PRs must be marked ready-for-review first."
+            }))
+        }
+
+        // propose_active_response — READ-ONLY proposal (T3 gated). The real send
+        // happens via POST /api/active-response after a click (Thor-gated).
+        "propose_active_response" => {
+            let command = arg_str(args, "command")?;
+            let agents: Vec<String> = args
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Ok(json!({
+                "action": "propose_active_response",
+                "command": command,
+                "agents": agents,
+                "needs_confirmation": true,
+                "tier": "T3",
+                "note": "Proposal only — confirm in the UI to send the Active Response (T3). Gated by Thor policy; requires AR configured on the Wazuh side to actually execute."
+            }))
+        }
+
         _ => Err(anyhow!("unknown tool: {}", name)),
     }
 }
 
-async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value> {
-    // Step 1 — basic auth → JWT
+/// Query Mimir's RAG knowledge base for the configured tenant, optionally scoped
+/// to specific data sources (Odin's AI-security KB). Uses Mimir's dense vector
+/// search endpoint (`/api/v1/vector/search`) — the hybrid `/api/search` path
+/// currently collapses dense results via a broken BM25 fusion, so we hit the
+/// vector endpoint directly for reliable semantic recall. Returns a trimmed list
+/// of {score, content} for the LLM to ground its answer on.
+pub async fn knowledge_search(client: &Client, cfg: &AgentConfig, query: &str, limit: u64) -> Result<Value> {
+    let mut body = json!({
+        "query": query,
+        "limit": limit,
+    });
+    if !cfg.mimir_kb_source_ids.is_empty() {
+        body["source_ids"] = json!(cfg.mimir_kb_source_ids);
+    }
+    let url = format!("{}/api/v1/vector/search", cfg.mimir_url);
+    let res = client
+        .post(&url)
+        .header("X-Tenant-Id", &cfg.mimir_tenant)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Ok(json!({ "error": format!("mimir {}: {}", status, text), "url": url }));
+            }
+            let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            // Response shape: { result: { points: [ { score, payload: { content } } ] } }
+            let results = parsed
+                .pointer("/result/points")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|h| json!({
+                            "score": h.get("score").cloned().unwrap_or(json!(null)),
+                            "content": h.pointer("/payload/content").and_then(|c| c.as_str()).unwrap_or(""),
+                        }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(json!({
+                "query": query,
+                "count": results.len(),
+                "results": results,
+                "source": "NCSA AI Security Guidelines (asgard_platform KB)"
+            }))
+        }
+        Err(e) => Ok(json!({ "error": format!("mimir unreachable: {}", e), "url": url })),
+    }
+}
+
+/// Wazuh manager API auth: basic creds → short-lived JWT.
+async fn tyr_jwt(client: &Client, cfg: &AgentConfig) -> Result<String> {
     let creds = format!("{}:{}", cfg.tyr_user, cfg.tyr_pass);
     let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
     let auth_url = format!("{}/security/user/authenticate", cfg.tyr_url);
@@ -218,16 +386,24 @@ async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value
     if !auth_res.status().is_success() {
         let s = auth_res.status();
         let b = auth_res.text().await.unwrap_or_default();
-        return Ok(json!({ "error": format!("tyr auth {}: {}", s, b) }));
+        return Err(anyhow!("tyr auth {}: {}", s, b));
     }
-    let auth_json: Value = auth_res.json().await
+    let auth_json: Value = auth_res
+        .json()
+        .await
         .map_err(|e| anyhow!("tyr auth json parse: {}", e))?;
-    let jwt = auth_json
+    auth_json
         .pointer("/data/token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("no JWT in tyr auth response"))?;
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("no JWT in tyr auth response"))
+}
 
-    // Step 2 — call actual endpoint with JWT bearer
+async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value> {
+    let jwt = match tyr_jwt(client, cfg).await {
+        Ok(j) => j,
+        Err(e) => return Ok(json!({ "error": e.to_string() })),
+    };
     let url = format!("{}{}", cfg.tyr_url, path);
     let res = client
         .get(&url)
@@ -243,7 +419,48 @@ async fn tyr_get(client: &Client, cfg: &AgentConfig, path: &str) -> Result<Value
     serde_json::from_str(&body).map_err(|e| anyhow!("tyr json parse: {}", e))
 }
 
-async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size: u64) -> Result<Value> {
+/// Send a Wazuh Active Response command to agents (T3 enforcement). Called by
+/// POST /api/active-response after human confirm + Thor gate. NOTE: actual
+/// execution requires the AR command to be configured on the Wazuh side
+/// (ossec.conf <active-response> + the script on agents).
+pub async fn active_response_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    command: &str,
+    agents: &[String],
+    arguments: &[String],
+) -> Value {
+    let jwt = match tyr_jwt(client, cfg).await {
+        Ok(j) => j,
+        Err(e) => return json!({ "status": "error", "error": e.to_string() }),
+    };
+    let agents_list = if agents.is_empty() { "*".to_string() } else { agents.join(",") };
+    let url = format!("{}/active-response?agents_list={}", cfg.tyr_url, agents_list);
+    let body = json!({ "command": command, "arguments": arguments, "alert": {} });
+    let res = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", jwt))
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                json!({ "status": "sent", "command": command, "agents": agents, "result": v.get("data") })
+            } else {
+                json!({
+                    "status": "error", "command": command,
+                    "error": v.get("detail").or_else(|| v.get("title")).cloned().unwrap_or(json!("wazuh rejected"))
+                })
+            }
+        }
+        Err(e) => json!({ "status": "error", "error": format!("wazuh AR unreachable: {}", e) }),
+    }
+}
+
+pub async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size: u64) -> Result<Value> {
     let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
     let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
     let url = format!("{}/wazuh-alerts-*/_search", cfg.tyr_indexer_url);
@@ -280,6 +497,62 @@ async fn tyr_search_alerts(client: &Client, cfg: &AgentConfig, query: &str, size
         .unwrap_or_default();
     let total = parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(hits.len()));
     Ok(json!({ "total": total, "alerts": hits }))
+}
+
+/// Vulnerability inventory — CVEs from Wazuh's vuln-detection state index.
+/// Returns empty (with a note) if vuln-detection isn't enabled / no agents scanned.
+pub async fn tyr_vuln_inventory(client: &Client, cfg: &AgentConfig, size: u64) -> Result<Value> {
+    let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
+    let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
+    let url = format!("{}/wazuh-states-vulnerabilities-*/_search", cfg.tyr_indexer_url);
+    let body = json!({
+        "size": size,
+        "query": { "match_all": {} },
+        "_source": ["agent.name", "package.name", "package.version", "vulnerability.id",
+                    "vulnerability.severity", "vulnerability.score.base", "vulnerability.status"]
+    });
+    let res = client.post(&url).header("Authorization", basic).header("Content-Type", "application/json")
+        .json(&body).send().await.map_err(|e| anyhow!("indexer request failed: {}", e))?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Ok(json!({ "total": 0, "vulnerabilities": [],
+            "note": format!("no vulnerability data (indexer {}). Vuln-detection may be disabled or no agents scanned yet.", status) }));
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let hits = parsed.pointer("/hits/hits").and_then(|h| h.as_array())
+        .map(|a| a.iter().filter_map(|h| h.get("_source").cloned()).collect::<Vec<_>>()).unwrap_or_default();
+    let total = parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(hits.len()));
+    Ok(json!({ "total": total, "vulnerabilities": hits }))
+}
+
+/// MITRE ATT&CK — aggregate recent alerts by technique + tactic (threat-hunting context).
+pub async fn tyr_mitre_summary(client: &Client, cfg: &AgentConfig) -> Result<Value> {
+    let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
+    let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
+    let url = format!("{}/wazuh-alerts-*/_search", cfg.tyr_indexer_url);
+    let body = json!({
+        "size": 0,
+        "query": { "exists": { "field": "rule.mitre.id" } },
+        "aggs": {
+            "techniques": { "terms": { "field": "rule.mitre.technique", "size": 15 } },
+            "tactics": { "terms": { "field": "rule.mitre.tactic", "size": 15 } }
+        }
+    });
+    let res = client.post(&url).header("Authorization", basic).header("Content-Type", "application/json")
+        .json(&body).send().await.map_err(|e| anyhow!("indexer request failed: {}", e))?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Ok(json!({ "alerts_with_mitre": 0, "top_techniques": [], "top_tactics": [],
+            "note": format!("indexer {}", status) }));
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "alerts_with_mitre": parsed.pointer("/hits/total/value").cloned().unwrap_or(json!(0)),
+        "top_techniques": parsed.pointer("/aggregations/techniques/buckets").cloned().unwrap_or(json!([])),
+        "top_tactics": parsed.pointer("/aggregations/tactics/buckets").cloned().unwrap_or(json!([]))
+    }))
 }
 
 async fn json_get(client: &Client, url: &str) -> Result<Value> {
@@ -369,6 +642,351 @@ pub async fn dedup_record(client: &Client, cfg: &AgentConfig, fingerprint: &str,
         .await;
 }
 
+/// Result of an issue-creation attempt. Shared shape for the HITL endpoint
+/// and the autonomous Týr bridge.
+pub struct IssueOutcome {
+    pub status: &'static str, // "created" | "duplicate" | "error"
+    pub issue_url: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub error: Option<String>,
+}
+
+/// Core issue creation: dedup → create on GitHub → record fingerprint.
+/// The single place an issue is actually filed; used by both `/api/issues/create`
+/// (human-confirmed) and the Týr alert→issue bridge (autonomous). Requires
+/// `cfg.github_token`; recurring identical (repo+title) findings are deduped.
+pub async fn create_issue_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    title: &str,
+    body: &str,
+    labels: &[&str],
+) -> IssueOutcome {
+    let fp = issue_fingerprint(repo, title);
+
+    if let Some(url) = dedup_lookup(client, cfg, &fp).await {
+        return IssueOutcome {
+            status: "duplicate",
+            issue_url: Some(url),
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: None,
+        };
+    }
+
+    // Thor policy gate (create) — centralised here so BOTH the HITL endpoint and
+    // the autonomous Týr bridge are governed (org allowlist, title/body sanity).
+    let verdict = crate::policy::check_create(
+        &crate::policy::CreatePolicy::from_env(), repo, title, body,
+    );
+    if !verdict.allow {
+        return IssueOutcome {
+            status: "denied",
+            issue_url: None,
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: Some(format!("Thor denied: {}", verdict.violations.join("; "))),
+        };
+    }
+
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => {
+            return IssueOutcome {
+                status: "error",
+                issue_url: None,
+                fingerprint: fp,
+                repo: repo.to_string(),
+                error: Some("GITHUB_TOKEN not configured on Odin".into()),
+            }
+        }
+    };
+
+    let url = format!("{}/repos/{}/issues", cfg.github_api_url, repo);
+    let payload = json!({ "title": title, "body": body, "labels": labels });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .json(&payload)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                let issue_url = v
+                    .get("html_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                dedup_record(client, cfg, &fp, repo, title, &issue_url).await;
+                IssueOutcome {
+                    status: "created",
+                    issue_url: Some(issue_url),
+                    fingerprint: fp,
+                    repo: repo.to_string(),
+                    error: None,
+                }
+            } else {
+                IssueOutcome {
+                    status: "error",
+                    issue_url: None,
+                    fingerprint: fp,
+                    repo: repo.to_string(),
+                    error: Some(format!(
+                        "github rejected: {}",
+                        v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+                    )),
+                }
+            }
+        }
+        Err(e) => IssueOutcome {
+            status: "error",
+            issue_url: None,
+            fingerprint: fp,
+            repo: repo.to_string(),
+            error: Some(format!("github unreachable: {}", e)),
+        },
+    }
+}
+
+// ── Phase 5: GitHub PR review/merge ──────────────────────────────────────────
+
+/// Resolve a target repo from tool args: prefer an explicit `repo` ("owner/repo"),
+/// else map a `service` name via service_to_repo.
+pub fn resolve_repo(args: &Value) -> String {
+    if let Some(r) = args.get("repo").and_then(|v| v.as_str()).filter(|s| s.contains('/')) {
+        return r.to_string();
+    }
+    service_to_repo(args.get("service").and_then(|v| v.as_str()).unwrap_or(""))
+}
+
+/// Authenticated GitHub GET → parsed JSON (or an {error} object — never panics).
+async fn github_get_authed(client: &Client, cfg: &AgentConfig, url: &str) -> Value {
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => return json!({ "error": "GITHUB_TOKEN not configured on Odin", "url": url }),
+    };
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return json!({ "error": format!("github {}: {}", status, text), "url": url });
+            }
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
+        }
+        Err(e) => json!({ "error": format!("github unreachable: {}", e), "url": url }),
+    }
+}
+
+/// List PRs for a repo (trimmed for the LLM). T2 read.
+pub async fn gh_pr_list(client: &Client, cfg: &AgentConfig, repo: &str, state: &str) -> Value {
+    let url = format!(
+        "{}/repos/{}/pulls?state={}&per_page=30&sort=updated&direction=desc",
+        cfg.github_api_url, repo, state
+    );
+    let v = github_get_authed(client, cfg, &url).await;
+    if v.get("error").is_some() {
+        return v;
+    }
+    let prs = v
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    json!({
+                        "number": p.get("number"),
+                        "title": p.get("title"),
+                        "draft": p.get("draft"),
+                        "state": p.get("state"),
+                        "user": p.pointer("/user/login"),
+                        "head": p.pointer("/head/ref"),
+                        "base": p.pointer("/base/ref"),
+                        "url": p.get("html_url"),
+                        "created_at": p.get("created_at"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({ "repo": repo, "count": prs.len(), "pulls": prs })
+}
+
+/// List issues for ANY repo (read-only, T2) — not limited to the repos Muninn
+/// watches. GitHub's /issues endpoint also returns PRs, so entries carrying a
+/// `pull_request` field are dropped. Use for on-demand triage of e.g. Mimir.
+pub async fn gh_issue_list(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    state: &str,
+    labels: Option<&str>,
+) -> Value {
+    let mut url = format!(
+        "{}/repos/{}/issues?state={}&per_page=30&sort=updated&direction=desc",
+        cfg.github_api_url, repo, state
+    );
+    if let Some(l) = labels.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&labels={}", l));
+    }
+    let v = github_get_authed(client, cfg, &url).await;
+    if v.get("error").is_some() {
+        return v;
+    }
+    let issues = v
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|p| p.get("pull_request").is_none()) // /issues returns PRs too — drop them
+                .map(|p| {
+                    let body = p.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                    let body_excerpt: String = body.chars().take(280).collect();
+                    let labels: Vec<&str> = p
+                        .get("labels")
+                        .and_then(|l| l.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.get("name").and_then(|n| n.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "number": p.get("number"),
+                        "title": p.get("title"),
+                        "state": p.get("state"),
+                        "user": p.pointer("/user/login"),
+                        "labels": labels,
+                        "comments": p.get("comments"),
+                        "url": p.get("html_url"),
+                        "created_at": p.get("created_at"),
+                        "updated_at": p.get("updated_at"),
+                        "body_excerpt": body_excerpt,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({ "repo": repo, "count": issues.len(), "issues": issues })
+}
+
+/// Get one PR: metadata + changed files with patches (for review). T2 read.
+pub async fn gh_pr_get(client: &Client, cfg: &AgentConfig, repo: &str, number: u64) -> Value {
+    let meta = github_get_authed(
+        client, cfg,
+        &format!("{}/repos/{}/pulls/{}", cfg.github_api_url, repo, number),
+    ).await;
+    if meta.get("error").is_some() {
+        return meta;
+    }
+    let files = github_get_authed(
+        client, cfg,
+        &format!("{}/repos/{}/pulls/{}/files?per_page=50", cfg.github_api_url, repo, number),
+    ).await;
+    let files_trim = files
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|f| {
+                    json!({
+                        "filename": f.get("filename"),
+                        "status": f.get("status"),
+                        "additions": f.get("additions"),
+                        "deletions": f.get("deletions"),
+                        "patch": f.get("patch"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "repo": repo,
+        "number": number,
+        "title": meta.get("title"),
+        "draft": meta.get("draft"),
+        "state": meta.get("state"),
+        "mergeable": meta.get("mergeable"),
+        "mergeable_state": meta.get("mergeable_state"),
+        "head": meta.pointer("/head/ref"),
+        "base": meta.pointer("/base/ref"),
+        "body": meta.get("body"),
+        "url": meta.get("html_url"),
+        "files": files_trim,
+    })
+}
+
+/// Merge a PR (T3, prod write). Called by POST /api/pulls/merge after a human
+/// confirms. `method` = merge | squash | rebase.
+pub async fn merge_pr_core(
+    client: &Client,
+    cfg: &AgentConfig,
+    repo: &str,
+    number: u64,
+    method: &str,
+) -> Value {
+    let token = match &cfg.github_token {
+        Some(t) => t.clone(),
+        None => return json!({ "status": "error", "error": "GITHUB_TOKEN not configured on Odin" }),
+    };
+    let url = format!("{}/repos/{}/pulls/{}/merge", cfg.github_api_url, repo, number);
+    let payload = json!({ "merge_method": method });
+    let resp = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "odin-orchestrator")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let ok = r.status().is_success();
+            let v: Value = r.json().await.unwrap_or_default();
+            if ok {
+                json!({ "status": "merged", "repo": repo, "number": number, "sha": v.get("sha") })
+            } else {
+                json!({
+                    "status": "error", "repo": repo, "number": number,
+                    "error": v.get("message").and_then(|m| m.as_str()).unwrap_or("github rejected merge")
+                })
+            }
+        }
+        Err(e) => json!({ "status": "error", "error": format!("github unreachable: {}", e) }),
+    }
+}
+
+/// Append an audit record to the `odin-audit` index (best-effort).
+pub async fn audit_event(client: &Client, cfg: &AgentConfig, action: &str, details: Value) {
+    let url = format!("{}/odin-audit/_doc", cfg.tyr_indexer_url);
+    let mut body = json!({ "action": action, "actor": "odin", "ts": chrono::Utc::now().to_rfc3339() });
+    if let (Some(obj), Some(extra)) = (body.as_object_mut(), details.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let _ = client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&body)
+        .send()
+        .await;
+}
+
 /// POST JSON to a URL, optionally setting X-Tenant-Id header.
 async fn json_post(client: &Client, url: &str, body: &Value, tenant_id: Option<&str>) -> Result<Value> {
     let mut req = client.post(url).json(body);
@@ -400,6 +1018,16 @@ pub fn tool_definitions() -> Value {
             "query": { "type": "string", "description": "Lucene query, default '*' (last N alerts)" },
             "size": { "type": "integer", "description": "max alerts to return, default 20, max 100" }
         })),
+        tool("tyr_sca_results", "Týr SCA (Security Configuration Assessment): recent CIS-benchmark / hardening findings (failed checks). Use to report host config-hardening posture.", json!({
+            "size": { "type": "integer", "description": "max findings, default 20, max 100" }
+        })),
+        tool("tyr_rootcheck", "Týr Rootcheck: rootkit / policy-violation / anomaly findings on monitored hosts.", json!({
+            "size": { "type": "integer", "description": "max findings, default 20, max 100" }
+        })),
+        tool("tyr_vuln_inventory", "Týr Vulnerability Detection: CVE inventory per agent (package, CVE id, severity, CVSS). Returns empty with a note if vuln-detection isn't enabled / no agents scanned yet.", json!({
+            "size": { "type": "integer", "description": "max CVEs, default 30, max 100" }
+        })),
+        tool("tyr_mitre_summary", "Týr MITRE ATT&CK: top techniques & tactics seen across recent alerts — threat-hunting context (e.g. 'this alert maps to T1190'). No args.", json!({})),
 
         // Várðr — Monitoring
         tool("vardr_health", "Várðr (Monitoring): service health", json!({})),
@@ -429,7 +1057,7 @@ pub fn tool_definitions() -> Value {
 
         // Muninn — Issue Watcher / Auto-Fixer
         tool("muninn_health", "Muninn (Issue Watcher): service health", json!({})),
-        tool("muninn_list_issues", "Muninn: list watched issues and their status", json!({})),
+        tool("muninn_list_issues", "Muninn: list only the issues Muninn is actively WATCHING for auto-fix (limited to the configured WATCHED_REPOS). To check issues on an arbitrary repo Muninn does not watch (e.g. Mimir), use gh_issue_list instead.", json!({})),
         tool("muninn_get_issue", "Muninn: detail for a single issue including remediation suggestions", json!({
             "issue_id": { "type": "string", "description": "issue id" }
         })),
@@ -462,6 +1090,12 @@ pub fn tool_definitions() -> Value {
         // Ratatoskr — shared headless browser service
         tool("ratatoskr_health", "Ratatoskr (shared headless browser): service health + session pool status", json!({})),
 
+        // knowledge_search — Mimir RAG over the AI-security knowledge base
+        tool("knowledge_search", "Search the AI Security knowledge base (NCSA 'AI Security Guidelines' / แนวปฏิบัติการใช้ปัญญาประดิษฐ์อย่างมั่นคงปลอดภัย, stored in Mimir). Use this to ground answers about AI/LLM threats (Prompt Injection, Data/Model Poisoning, Model Extraction, AI supply-chain attacks), secure AI lifecycle, risk assessment, and recommended controls/best-practices. Returns the most relevant passages (Thai). Query in Thai or English.", json!({
+            "query": { "type": "string", "description": "natural-language question or keywords, e.g. 'การป้องกัน Prompt Injection' or 'AI supply chain attack controls'" },
+            "limit": { "type": "integer", "description": "max passages to return, default 5, max 10" }
+        })),
+
         // propose_github_issue — staged write (T2). Returns a proposal for the human to
         // confirm in the UI; does NOT create the issue itself. Use after triaging an
         // alert/finding when the user asks to file/track it.
@@ -469,6 +1103,30 @@ pub fn tool_definitions() -> Value {
             "service": { "type": "string", "description": "service the issue is about, e.g. 'eir-gateway', 'mimir-api', 'tyr' — used to pick the repo" },
             "title": { "type": "string", "description": "concise issue title" },
             "body": { "type": "string", "description": "issue body in markdown (summary, evidence, remediation)" }
+        })),
+
+        // Phase 5 — GitHub PR review/merge (close the loop: issue→PR→review→merge)
+        tool("gh_issue_list", "List GitHub issues for ANY repo (read-only, T2) — including repos Muninn does NOT actively watch. Use this to check issues on a specific repo such as Mimir, Bifrost, Eir, Syn, Heimdall, etc. Pull requests are filtered out. Returns number, title, state, labels, author, comment count, and a body excerpt.", json!({
+            "repo": { "type": "string", "description": "'owner/repo' (e.g. 'MegaWiz-Dev-Team/Mimir') OR a short service name (e.g. 'mimir', 'bifrost', 'eir', 'syn', 'heimdall')" },
+            "state": { "type": "string", "description": "issue state: open | closed | all (default open)" }
+        })),
+        tool("gh_pr_list", "List GitHub pull requests for a repo (e.g. the draft PRs Muninn opened). Read-only (T2).", json!({
+            "repo": { "type": "string", "description": "target repo as 'owner/repo', e.g. 'MegaWiz-Dev-Team/Muninn'" }
+        })),
+        tool("gh_pr_get", "Get one pull request's metadata + changed files (with diff patches) so you can review it before recommending a merge. Read-only (T2).", json!({
+            "repo": { "type": "string", "description": "'owner/repo'" },
+            "number": { "type": "integer", "description": "pull request number" }
+        })),
+        tool("propose_pr_merge", "Propose merging a pull request (does NOT merge — returns a proposal + review info the human confirms with a button). T3 prod write; merge only happens after the click via /api/pulls/merge.", json!({
+            "repo": { "type": "string", "description": "'owner/repo'" },
+            "number": { "type": "integer", "description": "pull request number to merge" }
+        })),
+
+        // propose_active_response — Týr enforcement arm (T3). Proposal only; the send
+        // is executed + Thor-gated via POST /api/active-response after a human click.
+        tool("propose_active_response", "Propose a Wazuh Active Response (e.g. firewall-drop to block an IP, restart-wazuh, disable-account) on one or more agents. Does NOT execute — returns a proposal the human confirms. T3 enforcement; Thor-gated.", json!({
+            "command": { "type": "string", "description": "AR command name, e.g. 'firewall-drop', 'restart-wazuh', 'disable-account'" },
+            "agents": { "type": "array", "items": { "type": "string" }, "description": "target agent IDs, e.g. ['001']" }
         })),
     ])
 }
