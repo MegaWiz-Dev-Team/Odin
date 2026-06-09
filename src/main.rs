@@ -196,6 +196,95 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     }
 }
 
+/// One-page inspection roll-up: a status per SOC domain (Availability /
+/// Vulnerability / Remediation / Detection / Governance), each best-effort so one
+/// unreachable backend never fails the whole panel.
+async fn checks_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    use serde_json::json;
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+
+    // ── Availability ──
+    let svcs: [(&str, String); 5] = [
+        ("Heimdall", format!("{}/health", cfg.heimdall_url)),
+        ("Huginn", format!("{}/health", cfg.huginn_url)),
+        ("Muninn", format!("{}/health", cfg.muninn_url)),
+        ("Vardr", format!("{}/health", cfg.vardr_url)),
+        ("Loki", format!("{}/health", cfg.loki_url)),
+    ];
+    let mut up = 0u32;
+    for (_n, u) in &svcs {
+        if client.get(u).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+            up += 1;
+        }
+    }
+    let total = svcs.len() as u32;
+    checks.push(json!({
+        "domain": "Availability", "tool": "Vardr",
+        "status": if up == total { "ok" } else if up == 0 { "fail" } else { "warn" },
+        "metric": format!("{}/{} up", up, total), "detail": "core services responding"
+    }));
+
+    // ── Vulnerability (Huginn) ──
+    let v = match client.get(format!("{}/api/stats", cfg.huginn_url)).send().await.ok() {
+        Some(r) => r.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    match v {
+        Some(s) => {
+            let sev = s.get("by_severity").cloned().unwrap_or(json!({}));
+            let crit = sev.get("critical").and_then(|x| x.as_i64()).unwrap_or(0);
+            let high = sev.get("high").and_then(|x| x.as_i64()).unwrap_or(0);
+            let tf = s.get("total_findings").and_then(|x| x.as_i64()).unwrap_or(0);
+            checks.push(json!({
+                "domain": "Vulnerability", "tool": "Huginn",
+                "status": if crit > 0 { "fail" } else if high > 0 { "warn" } else { "ok" },
+                "metric": format!("{} findings", tf), "detail": format!("{} critical / {} high", crit, high)
+            }));
+        }
+        None => checks.push(json!({"domain":"Vulnerability","tool":"Huginn","status":"unknown","metric":"—","detail":"stats unavailable"})),
+    }
+
+    // ── Remediation (Muninn) ──
+    let r = match client.get(format!("{}/api/stats", cfg.muninn_url)).send().await.ok() {
+        Some(x) => x.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    match r {
+        Some(s) => {
+            let ti = s.get("total_issues").and_then(|x| x.as_i64()).unwrap_or(0);
+            let tf = s.get("total_fixes").and_then(|x| x.as_i64()).unwrap_or(0);
+            checks.push(json!({"domain":"Remediation","tool":"Muninn","status":"ok","metric":format!("{} issues",ti),"detail":format!("{} fixes",tf)}));
+        }
+        None => checks.push(json!({"domain":"Remediation","tool":"Muninn","status":"unknown","metric":"—","detail":"stats unavailable"})),
+    }
+
+    // ── Detection (Tyr indexer) ──
+    let det = client
+        .get(format!("{}/_cluster/health", cfg.tyr_indexer_url))
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send().await.map(|r| r.status().is_success()).unwrap_or(false);
+    checks.push(json!({"domain":"Detection","tool":"Tyr","status": if det {"ok"} else {"fail"},"metric": if det {"reachable"} else {"down"},"detail":"SIEM indexer"}));
+
+    // ── Governance (Thor audit trail) ──
+    let g = match client
+        .get(format!("{}/odin-audit/_count", cfg.tyr_indexer_url))
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send().await.ok()
+    {
+        Some(x) => x.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    let gc = g.and_then(|x| x.get("count").and_then(|c| c.as_i64())).unwrap_or(-1);
+    checks.push(json!({
+        "domain":"Governance","tool":"Thor","status": if gc >= 0 {"ok"} else {"unknown"},
+        "metric": if gc >= 0 { format!("{} decisions", gc) } else { "—".to_string() }, "detail":"policy audit trail"
+    }));
+
+    Json(json!({ "checks": checks }))
+}
+
 #[derive(Deserialize)]
 struct BatchStatusRequest {
     scans: Vec<String>,
@@ -546,6 +635,7 @@ async fn main() {
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/audit", axum::routing::get(audit_proxy))
+        .route("/api/checks", axum::routing::get(checks_proxy))
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))
         .route("/api/active-response", post(active_response))

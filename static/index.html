@@ -417,6 +417,7 @@
         <div class="tab" data-tab="loadtests" id="tabLoadtests">🔨 Load Tests</div>
         <div class="tab" data-tab="services" id="tabServices">🔌 Services</div>
         <div class="tab" data-tab="audit" id="tabAudit">🔨 Policy / Audit</div>
+        <div class="tab" data-tab="checks" id="tabChecks">🩺 Checks</div>
     </div>
 
     <div class="content">
@@ -514,6 +515,15 @@
                 <h3>No policy decisions yet</h3>
                 <p>Thor verdicts (allow/deny) and governance actions are recorded here as they happen.</p>
             </div>
+        </div>
+
+        <!-- Checks Tab — one-page roll-up across SOC domains (/api/checks) -->
+        <div class="tab-content" id="contentChecks">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+                <div style="font-size:0.8rem;color:var(--text-muted)">🩺 Daily/Weekly check — one status per SOC domain (Availability / Vulnerability / Remediation / Detection / Governance)</div>
+                <button class="btn btn-approve" onclick="fetchChecks()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
+            </div>
+            <div id="checksGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px"></div>
         </div>
     </div>
 
@@ -622,6 +632,7 @@
                 if (key === 'services') fetchServices();
                 if (key === 'loadtests') fetchLoadTests();
                 if (key === 'audit') fetchAudit();
+                if (key === 'checks') fetchChecks();
             });
         });
         function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -659,6 +670,29 @@
                 }).join('');
             } catch (err) {
                 body.innerHTML = `<tr><td colspan="5" style="color:var(--danger)">${escA(err.message)}</td></tr>`;
+            }
+        }
+
+        // ── Checks roll-up (one status per SOC domain) ──
+        async function fetchChecks() {
+            const grid = document.getElementById('checksGrid');
+            grid.innerHTML = '<div style="color:var(--text-muted)">Loading…</div>';
+            try {
+                const res = await fetch('/api/checks', { headers: odinAuthHeaders() });
+                const checks = (await res.json()).checks || [];
+                const color = s => s==='ok'?'#22c55e':s==='warn'?'#f59e0b':s==='fail'?'#ef4444':'#9ca3af';
+                const icon = s => s==='ok'?'✅':s==='warn'?'⚠️':s==='fail'?'❌':'❔';
+                grid.innerHTML = checks.map(c => `
+                  <div style="border:1px solid rgba(255,255,255,0.12);border-left:4px solid ${color(c.status)};border-radius:8px;padding:12px 14px;background:rgba(255,255,255,0.03)">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                      <span style="font-weight:600">${icon(c.status)} ${escA(c.domain)}</span>
+                      <span style="font-size:.72rem;color:var(--text-muted)">${escA(c.tool)}</span>
+                    </div>
+                    <div style="font-size:1.05rem;font-weight:600;margin:4px 0">${escA(c.metric)}</div>
+                    <div style="font-size:.78rem;color:var(--text-muted)">${escA(c.detail)}</div>
+                  </div>`).join('');
+            } catch (err) {
+                grid.innerHTML = `<div style="color:var(--danger)">${escA(err.message)}</div>`;
             }
         }
 
