@@ -1,0 +1,162 @@
+# Asgard SOC ops CronJobs — the scheduled checks that were previously manual.
+# (Huginn VA already has its own crons in Huginn/k8s/03-cronjob.yaml.)
+# Off-peak + Forbid concurrency to respect the Mac mini's resource limits — these
+# never overlap each other or the nightly Huginn VA (03:00).
+#
+# Apply order: loki-weekly is safe (no extra RBAC). cve-sweep + cert-expiry create
+# ServiceAccounts/RBAC — REVIEW before applying:
+#   kubectl apply -f k8s/02-ops-cronjobs.yaml
+# backup-verify is HOST-side (T7 is a host volume) — see ops/backup-verify.plist.
+---
+# ── Loki weekly red-team (purple-team: then confirm Týr detected it) ──
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: loki-weekly-redteam
+  namespace: asgard
+  labels: { app: loki, job: weekly-redteam }
+spec:
+  schedule: "0 4 * * 0" # Sunday 04:00 (off-peak, heavy)
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200 # 2h cap
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: redteam-trigger
+              image: curlimages/curl:latest
+              imagePullPolicy: IfNotPresent
+              args:
+                - /bin/sh
+                - -c
+                - |
+                  echo "🗡️  Loki weekly red-team campaign…"
+                  curl -fsS -X POST http://loki-api.asgard.svc.cluster.local:8000/api/v1/loki/scan \
+                    -H 'Content-Type: application/json' -H 'X-Loki-Test: true' \
+                    -d '{"targets":["http://bifrost.asgard.svc:8100","http://mimir-api.asgard.svc:8080","http://eir-gateway.asgard.svc:3000","http://syn-api.asgard.svc:8080"],"environment":"production"}' \
+                    -w "\nHTTP %{http_code}\n"
+                  echo "↳ purple-team: verify Týr raised matching detections."
+---
+# ── CVE / dependency sweep (trivy against the cluster) ──
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: cve-sweep, namespace: asgard }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: cve-sweep-read }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "replicationcontrollers", "services", "configmaps"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: cve-sweep-read }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cve-sweep-read }
+subjects:
+  - { kind: ServiceAccount, name: cve-sweep, namespace: asgard }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cve-sweep-weekly
+  namespace: asgard
+  labels: { app: huginn, job: cve-sweep }
+spec:
+  schedule: "0 2 * * 1" # Monday 02:00
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 5400 # 90m
+      template:
+        spec:
+          serviceAccountName: cve-sweep
+          restartPolicy: OnFailure
+          containers:
+            - name: trivy
+              image: aquasec/trivy:latest
+              imagePullPolicy: IfNotPresent
+              args:
+                - k8s
+                - --namespace
+                - asgard
+                - --severity
+                - HIGH,CRITICAL
+                - --scanners
+                - vuln
+                - --report
+                - summary
+---
+# ── Cert / JWT expiry check (TLS secrets in the namespace) ──
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: cert-expiry, namespace: asgard }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: cert-expiry-read, namespace: asgard }
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"] # scoped to asgard ns; needed to read tls.crt notAfter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: cert-expiry-read, namespace: asgard }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: cert-expiry-read }
+subjects:
+  - { kind: ServiceAccount, name: cert-expiry, namespace: asgard }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cert-expiry-weekly
+  namespace: asgard
+  labels: { app: tyr, job: cert-expiry }
+spec:
+  schedule: "0 6 * * 1" # Monday 06:00
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: cert-expiry
+          restartPolicy: OnFailure
+          containers:
+            - name: cert-check
+              image: bitnami/kubectl:latest
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  echo "🔐 TLS secret expiry (warn < 30 days)…"
+                  warn=0
+                  for s in $(kubectl get secrets -n asgard -o jsonpath='{range .items[?(@.type=="kubernetes.io/tls")]}{.metadata.name}{"\n"}{end}'); do
+                    crt=$(kubectl get secret -n asgard "$s" -o jsonpath='{.data.tls\.crt}' | base64 -d)
+                    end=$(echo "$crt" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+                    [ -z "$end" ] && continue
+                    days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+                    flag=""; [ "$days" -lt 30 ] && { flag="  ⚠️ EXPIRING"; warn=1; }
+                    echo "  $s: $days days ($end)$flag"
+                  done
+                  [ "$warn" = 1 ] && echo "❌ cert(s) expiring < 30d" || echo "✅ all TLS certs > 30d"
