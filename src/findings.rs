@@ -201,6 +201,76 @@ async fn send_discord_notification(
     }
 }
 
+/// Approval request from Muninn (Thor rated a finding L2/L3 — needs human sign-off).
+#[derive(Deserialize)]
+pub struct MuninnApprovalRequest {
+    pub issue_id: String,
+    pub repo: String,
+    #[serde(default)]
+    pub issue_number: u64,
+    #[serde(default)]
+    pub title: String,
+    pub level: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub approve_url: Option<String>,
+    #[serde(default)]
+    pub reject_url: Option<String>,
+}
+
+/// POST /api/approvals — Muninn asks Odin to get a human to approve a fix.
+/// Odin posts it to Discord (with approve/reject links). A human then approves —
+/// in Discord, or by having Odin call the `muninn_approve_fix` tool — which
+/// commands Muninn back to run the fix.
+pub async fn muninn_approval_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<MuninnApprovalRequest>,
+) -> Result<(), (StatusCode, String)> {
+    let cfg = &state.cfg;
+    tracing::info!("🗡️ Muninn approval request: {} {} ({})", req.issue_id, req.level, req.repo);
+
+    let Some(webhook_url) = cfg.discord_webhook_url.clone() else {
+        warn!("DISCORD_WEBHOOK_URL not set — approval {} not posted to Discord", req.issue_id);
+        return Ok(());
+    };
+
+    let color = if req.level == "L3" { 0xFF0000 } else { 0xFFA500 };
+    let mut fields = vec![
+        json!({ "name": "Repo", "value": format!("{}#{}", req.repo, req.issue_number), "inline": true }),
+        json!({ "name": "Risk", "value": req.level, "inline": true }),
+        json!({
+            "name": "Why",
+            "value": if req.reasons.is_empty() { "—".to_string() } else { req.reasons.join("\n") },
+            "inline": false
+        }),
+    ];
+    let action = match (&req.approve_url, &req.reject_url) {
+        (Some(a), Some(r)) => format!("✅ [Approve]({})  ·  ❌ [Reject]({})", a, r),
+        (Some(a), None) => format!("✅ [Approve]({})", a),
+        _ => format!("Approve via Odin: `muninn_approve_fix {}`", req.issue_id),
+    };
+    fields.push(json!({ "name": "Action", "value": action, "inline": false }));
+
+    let embed = json!({
+        "title": format!("⚡ Muninn fix needs approval — {}", req.title),
+        "color": color,
+        "fields": fields,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    let payload = json!({ "embeds": [embed] });
+
+    let client = reqwest::Client::new();
+    match client.post(&webhook_url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("✅ Approval request posted to Discord: {}", req.issue_id);
+        }
+        Ok(resp) => warn!("⚠️ Discord returned {} for approval {}", resp.status(), req.issue_id),
+        Err(e) => warn!("❌ Discord approval post failed: {}", e),
+    }
+    Ok(())
+}
+
 // GET /api/reports/:scan_id - Returns ISO 27001 security report as HTML
 pub async fn get_report_html(
     Path(scan_id): Path<String>,

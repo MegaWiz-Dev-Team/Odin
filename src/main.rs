@@ -649,6 +649,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/huginn-findings", post(findings::huginn_findings_handler))
+        .route("/api/approvals", post(findings::muninn_approval_handler))
         .route("/api/reports/{scan_id}", axum::routing::get(findings::get_report_html))
         .merge(protected)
         .with_state(chat_state)
