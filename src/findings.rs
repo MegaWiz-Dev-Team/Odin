@@ -485,6 +485,44 @@ pub async fn tyr_alert_handler(
     Json(json!({ "received": true, "critical": critical, "muninn_paused": muninn_paused }))
 }
 
+#[derive(Deserialize, Default)]
+pub struct GovAuditRequest {
+    #[serde(default)] pub level: String,
+    #[serde(default)] pub detail: String,
+    #[serde(default)] pub repo: String,
+    #[serde(default)] pub issue_number: u64,
+    #[serde(default)] pub kind: String,
+    #[serde(default)] pub severity: String,
+}
+
+/// POST /api/governance-audit — Muninn reports a Thor governance decision; record
+/// it in the `odin-audit` index so the Policy panel shows Thor's L0-L3 verdicts
+/// next to Odin's own governance actions. Unprotected (internal Muninn → Odin).
+pub async fn governance_audit_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<GovAuditRequest>,
+) -> Json<Value> {
+    let action = if req.level.is_empty() {
+        format!("muninn:{}", if req.kind.is_empty() { "event".into() } else { req.kind.clone() })
+    } else {
+        format!("thor:{}", req.level)
+    };
+    let target = if req.repo.is_empty() {
+        "—".to_string()
+    } else {
+        format!("{}#{}", req.repo, req.issue_number)
+    };
+    crate::agents::audit_event(
+        &reqwest::Client::new(),
+        &state.cfg,
+        &action,
+        json!({ "actor": "muninn", "target": target, "detail": req.detail,
+                "severity": req.severity, "kind": req.kind }),
+    )
+    .await;
+    Json(json!({ "ok": true }))
+}
+
 // GET /api/reports/:scan_id - Returns ISO 27001 security report as HTML
 pub async fn get_report_html(
     Path(scan_id): Path<String>,

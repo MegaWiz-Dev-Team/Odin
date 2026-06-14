@@ -767,7 +767,10 @@ async fn main() {
         .route("/api/approvals", post(findings::muninn_approval_handler))
         .route("/api/plan-review", post(findings::plan_review_handler))
         .route("/api/tyr-alert", post(findings::tyr_alert_handler))
+        .route("/api/governance-audit", post(findings::governance_audit_handler))
         .route("/api/reports/{scan_id}", axum::routing::get(findings::get_report_html))
+        // Quiet the browser's favicon probe (was a 404 in the console).
+        .route("/favicon.ico", axum::routing::get(|| async { axum::http::StatusCode::NO_CONTENT }))
         .merge(protected)
         .with_state(chat_state)
         .fallback_service(static_dir)
