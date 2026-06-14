@@ -92,6 +92,14 @@ spec:
               name: odin-secrets
               key: HEIMDALL_API_KEY
               optional: true
+        # Fixed session token (Secret odin-session) so a redeploy doesn't log
+        # every dashboard out — without it the token is random per process.
+        - name: ODIN_SESSION_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: odin-session
+              key: token
+              optional: true
         resources:
           requests:
             memory: "256Mi"
