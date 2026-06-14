@@ -230,6 +230,33 @@ async fn trigger_proxy(
     issue_action_proxy(state, id, "fix").await
 }
 
+/// Where a repo sits in the Asgard dependency stack — foundational services
+/// (everything builds on them) first, leaf apps last. Orders the issue table so
+/// the base of the stack is triaged before what depends on it.
+fn dep_tier(repo: &str) -> u8 {
+    let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
+    match name.as_str() {
+        "heimdall" => 0,
+        "yggdrasil" | "mimir" => 1,
+        "bifrost" | "thor" | "tyr" => 2,
+        "huginn" | "muninn" | "forseti" | "skuggi" | "hermodr" => 3,
+        "eir" | "syn" | "bragi" | "saga" | "laminar" | "nott" => 4,
+        "odin" => 5,
+        _ => 6,
+    }
+}
+
+/// Severity order: critical first, low last; unknown sorts last.
+fn prio_rank(p: &str) -> u8 {
+    match p.to_ascii_lowercase().as_str() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
 async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
@@ -240,7 +267,22 @@ async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
         .ok();
     match body {
         Some(r) => match r.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
+            Ok(mut v) => {
+                // Order by severity, then dependency tier (base of the stack
+                // first), then repo + number for a stable ordering.
+                if let Some(arr) = v.as_array_mut() {
+                    arr.sort_by(|a, b| {
+                        let key = |x: &serde_json::Value| {
+                            let prio = x.get("priority").and_then(|p| p.as_str()).unwrap_or("");
+                            let repo = x.get("repo").and_then(|r| r.as_str()).unwrap_or("");
+                            let num = x.get("issue_number").and_then(|n| n.as_u64()).unwrap_or(0);
+                            (prio_rank(prio), dep_tier(repo), repo.to_string(), num)
+                        };
+                        key(a).cmp(&key(b))
+                    });
+                }
+                Json(v)
+            }
             Err(_) => Json(serde_json::json!([])),
         },
         None => Json(serde_json::json!([])),
