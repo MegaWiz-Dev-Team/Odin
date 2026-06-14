@@ -295,7 +295,7 @@ pub async fn plan_review_handler(
     let cfg = &state.cfg;
     tracing::info!("🧠 plan-review for {} ({})", req.issue_id, req.repo);
 
-    let (odin_vote, frigg_vote, reason) = vote_on_plan(cfg, &req).await;
+    let (odin_vote, frigg_vote, odin_reason, frigg_reason) = vote_on_plan(cfg, &req).await;
     let cv = thor::evaluate_consensus(
         &json!({ "odin": odin_vote, "frigg": frigg_vote }).to_string(),
     );
@@ -303,8 +303,15 @@ pub async fn plan_review_handler(
         "🧠 plan-review {} → {} (odin={}, frigg={})",
         req.issue_id, cv.decision, odin_vote, frigg_vote
     );
-    let conditions: Vec<String> =
-        if cv.decision != "approve" && !reason.is_empty() { vec![reason] } else { vec![] };
+    let mut conditions: Vec<String> = vec![];
+    if cv.decision != "approve" {
+        if odin_vote != "approve" && !odin_reason.is_empty() {
+            conditions.push(format!("Odin: {}", odin_reason));
+        }
+        if frigg_vote != "approve" && !frigg_reason.is_empty() {
+            conditions.push(format!("Frigg: {}", frigg_reason));
+        }
+    }
 
     Json(json!({
         "decision": cv.decision,
@@ -315,22 +322,46 @@ pub async fn plan_review_handler(
     }))
 }
 
-/// One Heimdall call that returns the Odin + Frigg votes on a plan. Fails safe to
-/// (reject, reject) on any error or unparseable output.
-async fn vote_on_plan(cfg: &AgentConfig, req: &PlanReviewRequest) -> (String, String, String) {
-    let prompt = format!(
-        "Two Asgard advisors review Muninn's automated fix PLAN before any code is written.\n\
-         Issue: {} ({})\nPlan: {}\n\n\
-         Odin (commander) judges: is the approach feasible, in-scope, and minimal?\n\
-         Frigg (advisor) judges: is it SAFE — small blast radius, reversible, no auth/crypto/data risk?\n\
-         Each votes approve | conditional | reject. Be conservative — prefer conditional/reject when unsure.\n\
-         Respond ONLY with JSON: {{\"odin\":\"approve|conditional|reject\",\"frigg\":\"approve|conditional|reject\",\"reason\":\"one short sentence\"}}",
-        req.title, req.repo, req.plan
+/// Two INDEPENDENT advisor votes on a plan: Odin (feasibility) and Frigg (safety)
+/// each get their own Heimdall call with a distinct prompt, run concurrently, so
+/// neither sees the other's reasoning. Returns (odin_vote, frigg_vote,
+/// odin_reason, frigg_reason). Each fails safe to reject.
+async fn vote_on_plan(cfg: &AgentConfig, req: &PlanReviewRequest) -> (String, String, String, String) {
+    let odin = one_vote(
+        cfg, req, "Odin, the commander",
+        "Is the approach FEASIBLE, in-scope, and MINIMAL? Reject scope creep, over-engineering, or a fix that doesn't address the root cause.",
     );
+    let frigg = one_vote(
+        cfg, req, "Frigg, the advisor",
+        "Is it SAFE — small blast radius, easily reversible, free of auth/crypto/data/secret risk? Reject anything hard to revert or touching sensitive paths.",
+    );
+    let ((ov, or), (fv, fr)) = tokio::join!(odin, frigg);
+    (ov, fv, or, fr)
+}
+
+/// A single advisor's independent vote — one Heimdall call with its own persona
+/// and criteria. Fails safe to ("reject", …).
+async fn one_vote(cfg: &AgentConfig, req: &PlanReviewRequest, role: &str, criteria: &str) -> (String, String) {
+    let prompt = format!(
+        "You are {role}, an Asgard advisor reviewing Muninn's automated fix PLAN before any code is written.\n\
+         Issue: {} ({})\nPlan: {}\n\n\
+         Judge ONLY this: {criteria}\n\
+         Vote approve | conditional | reject — be conservative, prefer conditional/reject when unsure.\n\
+         Respond ONLY with JSON: {{\"vote\":\"approve|conditional|reject\",\"reason\":\"one short sentence\"}}",
+        req.title, req.repo, req.plan,
+    );
+    match heimdall_complete(cfg, &prompt).await {
+        Some(c) => parse_vote(&c),
+        None => ("reject".to_string(), "llm unreachable".to_string()),
+    }
+}
+
+/// One Heimdall chat completion → the assistant message text (None on error).
+async fn heimdall_complete(cfg: &AgentConfig, prompt: &str) -> Option<String> {
     let body = json!({
         "model": cfg.heimdall_model,
         "messages": [{ "role": "user", "content": prompt }],
-        "max_tokens": 300,
+        "max_tokens": 200,
         "temperature": 0.1
     });
     let client = reqwest::Client::new();
@@ -338,33 +369,50 @@ async fn vote_on_plan(cfg: &AgentConfig, req: &PlanReviewRequest) -> (String, St
     if let Some(k) = &cfg.heimdall_api_key {
         rb = rb.header("Authorization", format!("Bearer {}", k));
     }
-    let content = match rb.send().await {
+    match rb.send().await {
         Ok(r) => {
             let v: Value = r.json().await.unwrap_or_default();
-            v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+            v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).map(String::from)
         }
         Err(e) => {
             warn!("plan-review LLM unreachable: {}", e);
-            return ("reject".into(), "reject".into(), "llm unreachable".into());
+            None
         }
-    };
+    }
+}
+
+/// Parse an advisor's `{vote, reason}` JSON out of the model text. Fails safe to
+/// ("reject", …) — an unknown or missing vote is a reject.
+fn parse_vote(content: &str) -> (String, String) {
     let json_str = match (content.find('{'), content.rfind('}')) {
         (Some(a), Some(b)) if b > a => &content[a..=b],
-        _ => return ("reject".into(), "reject".into(), "unparseable vote".into()),
+        _ => return ("reject".to_string(), "unparseable vote".to_string()),
     };
     match serde_json::from_str::<Value>(json_str) {
         Ok(v) => {
-            let norm = |k: &str| -> String {
-                let s = v.get(k).and_then(|x| x.as_str()).unwrap_or("reject").to_lowercase();
-                match s.as_str() {
-                    "approve" => "approve".into(),
-                    "conditional" => "conditional".into(),
-                    _ => "reject".into(),
-                }
-            };
-            (norm("odin"), norm("frigg"), v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string())
+            let raw = v.get("vote").and_then(|x| x.as_str()).unwrap_or("reject").to_lowercase();
+            let vote = match raw.as_str() {
+                "approve" => "approve",
+                "conditional" => "conditional",
+                _ => "reject",
+            }
+            .to_string();
+            (vote, v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string())
         }
-        Err(_) => ("reject".into(), "reject".into(), "unparseable vote".into()),
+        Err(_) => ("reject".to_string(), "unparseable vote".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod plan_review_tests {
+    use super::parse_vote;
+
+    #[test]
+    fn parse_vote_normalizes_and_fails_safe() {
+        assert_eq!(parse_vote(r#"{"vote":"approve","reason":"ok"}"#), ("approve".to_string(), "ok".to_string()));
+        assert_eq!(parse_vote("noise {\"vote\":\"CONDITIONAL\",\"reason\":\"r\"} tail").0, "conditional");
+        assert_eq!(parse_vote("garbage no json").0, "reject");
+        assert_eq!(parse_vote(r#"{"vote":"maybe"}"#).0, "reject"); // unknown vote → reject
     }
 }
 
