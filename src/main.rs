@@ -161,6 +161,19 @@ async fn health_proxy(State(state): State<ChatState>) -> impl IntoResponse {
 /// Proxy Muninn's tracked issues through Odin (browser can't reach Muninn's
 /// ClusterIP / localhost-only port-forward, esp. over Tailscale). Returns the
 /// raw JSON array, or [] on any failure so the UI degrades gracefully.
+/// Proxy Muninn's fix-pipeline progress to the dashboard (Odin UI).
+async fn progress_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    match client.get(format!("{}/api/progress", cfg.muninn_url)).send().await.ok() {
+        Some(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(_) => Json(serde_json::json!({})),
+        },
+        None => Json(serde_json::json!({})),
+    }
+}
+
 async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
@@ -642,6 +655,7 @@ async fn main() {
         .route("/api/huginn/batch-status", post(huginn_batch_status))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
+        .route("/api/muninn-progress", axum::routing::get(progress_proxy))
         .layer(middleware::from_fn(require_auth));
 
     // Public — login (issues the token), the Huginn webhook (machine-to-machine),

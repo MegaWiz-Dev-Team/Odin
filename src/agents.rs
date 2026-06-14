@@ -181,6 +181,7 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             json_get(&client, &format!("{}/api/issues/{}", cfg.muninn_url, id)).await
         }
         "muninn_stats" => json_get(&client, &format!("{}/api/stats", cfg.muninn_url)).await,
+        "muninn_progress" => json_get(&client, &format!("{}/api/progress", cfg.muninn_url)).await,
 
         // Muninn write-paths — Odin commands Muninn to fix.
         "muninn_approve_fix" => {
@@ -1076,6 +1077,7 @@ pub fn tool_definitions() -> Value {
             "issue_id": { "type": "string", "description": "issue id" }
         })),
         tool("muninn_stats", "Muninn: aggregate issue stats", json!({})),
+        tool("muninn_progress", "Muninn: auto-fix pipeline progress — status breakdown (pending/fixing/review_pending/fixed/failed), pause state, in-flight fixes, and recently-fixed issues with PR links", json!({})),
         tool("muninn_approve_fix", "Muninn: APPROVE a review_pending fix and command Muninn to run it (re-analyze → Claude Code → draft PR). Use after a human approves an L2/L3 finding in Discord.", json!({
             "issue_id": { "type": "string", "description": "issue id" }
         })),
