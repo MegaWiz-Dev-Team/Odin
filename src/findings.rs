@@ -7,6 +7,7 @@ use tracing::warn;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
+use crate::agents::AgentConfig;
 use crate::chat::{run_agent, ChatState};
 use crate::report;
 
@@ -269,6 +270,102 @@ pub async fn muninn_approval_handler(
         Err(e) => warn!("❌ Discord approval post failed: {}", e),
     }
     Ok(())
+}
+
+/// Muninn's fix-plan review request (Odin+Frigg advisory consensus).
+#[derive(Deserialize)]
+pub struct PlanReviewRequest {
+    pub issue_id: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub plan: Value,
+}
+
+/// POST /api/plan-review — Muninn asks the Odin+Frigg advisory panel to review a
+/// fix plan BEFORE any code is written. Odin (commander) judges feasibility,
+/// Frigg (advisor) judges safety; the two votes are combined by Thor's consensus
+/// policy. Fails safe to `reject` on any LLM error.
+pub async fn plan_review_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<PlanReviewRequest>,
+) -> Json<Value> {
+    let cfg = &state.cfg;
+    tracing::info!("🧠 plan-review for {} ({})", req.issue_id, req.repo);
+
+    let (odin_vote, frigg_vote, reason) = vote_on_plan(cfg, &req).await;
+    let cv = thor::evaluate_consensus(
+        &json!({ "odin": odin_vote, "frigg": frigg_vote }).to_string(),
+    );
+    tracing::info!(
+        "🧠 plan-review {} → {} (odin={}, frigg={})",
+        req.issue_id, cv.decision, odin_vote, frigg_vote
+    );
+    let conditions: Vec<String> =
+        if cv.decision != "approve" && !reason.is_empty() { vec![reason] } else { vec![] };
+
+    Json(json!({
+        "decision": cv.decision,
+        "can_proceed": cv.can_proceed,
+        "odin_vote": odin_vote,
+        "frigg_vote": frigg_vote,
+        "conditions": conditions,
+    }))
+}
+
+/// One Heimdall call that returns the Odin + Frigg votes on a plan. Fails safe to
+/// (reject, reject) on any error or unparseable output.
+async fn vote_on_plan(cfg: &AgentConfig, req: &PlanReviewRequest) -> (String, String, String) {
+    let prompt = format!(
+        "Two Asgard advisors review Muninn's automated fix PLAN before any code is written.\n\
+         Issue: {} ({})\nPlan: {}\n\n\
+         Odin (commander) judges: is the approach feasible, in-scope, and minimal?\n\
+         Frigg (advisor) judges: is it SAFE — small blast radius, reversible, no auth/crypto/data risk?\n\
+         Each votes approve | conditional | reject. Be conservative — prefer conditional/reject when unsure.\n\
+         Respond ONLY with JSON: {{\"odin\":\"approve|conditional|reject\",\"frigg\":\"approve|conditional|reject\",\"reason\":\"one short sentence\"}}",
+        req.title, req.repo, req.plan
+    );
+    let body = json!({
+        "model": cfg.heimdall_model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 300,
+        "temperature": 0.1
+    });
+    let client = reqwest::Client::new();
+    let mut rb = client.post(format!("{}/v1/chat/completions", cfg.heimdall_url)).json(&body);
+    if let Some(k) = &cfg.heimdall_api_key {
+        rb = rb.header("Authorization", format!("Bearer {}", k));
+    }
+    let content = match rb.send().await {
+        Ok(r) => {
+            let v: Value = r.json().await.unwrap_or_default();
+            v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+        }
+        Err(e) => {
+            warn!("plan-review LLM unreachable: {}", e);
+            return ("reject".into(), "reject".into(), "llm unreachable".into());
+        }
+    };
+    let json_str = match (content.find('{'), content.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &content[a..=b],
+        _ => return ("reject".into(), "reject".into(), "unparseable vote".into()),
+    };
+    match serde_json::from_str::<Value>(json_str) {
+        Ok(v) => {
+            let norm = |k: &str| -> String {
+                let s = v.get(k).and_then(|x| x.as_str()).unwrap_or("reject").to_lowercase();
+                match s.as_str() {
+                    "approve" => "approve".into(),
+                    "conditional" => "conditional".into(),
+                    _ => "reject".into(),
+                }
+            };
+            (norm("odin"), norm("frigg"), v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string())
+        }
+        Err(_) => ("reject".into(), "reject".into(), "unparseable vote".into()),
+    }
 }
 
 // GET /api/reports/:scan_id - Returns ISO 27001 security report as HTML
