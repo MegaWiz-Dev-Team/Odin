@@ -100,6 +100,14 @@ spec:
               name: odin-session
               key: token
               optional: true
+        # Dashboard login password — Secret, never a plaintext literal here.
+        - name: ODIN_USER
+          value: admin
+        - name: ODIN_PASS
+          valueFrom:
+            secretKeyRef:
+              name: odin-secrets
+              key: ODIN_PASS
         resources:
           requests:
             memory: "256Mi"
