@@ -427,6 +427,64 @@ mod plan_review_tests {
     }
 }
 
+/// Tyr anomaly alert about the auto-fix watchdog (governance telemetry breached
+/// a Wazuh rule). Odin = the command layer.
+#[derive(Deserialize)]
+pub struct TyrAlertRequest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// POST /api/tyr-alert — Tyr's anomaly detection fires here. Odin posts it to
+/// Discord and, for high/critical alerts, COMMANDS Muninn to pause auto-fix
+/// (POST muninn /api/control). Tyr watches; Odin commands.
+pub async fn tyr_alert_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<TyrAlertRequest>,
+) -> Json<Value> {
+    let cfg = &state.cfg;
+    let critical = matches!(req.severity.as_str(), "high" | "critical");
+    tracing::warn!("🛡️ Tyr alert: {} [{}] {} ({})", req.kind, req.severity, req.message, req.repo);
+
+    if let Some(webhook) = cfg.discord_webhook_url.clone() {
+        let color = if critical { 0xFF0000 } else { 0xFFA500 };
+        let detail = if req.message.is_empty() { req.detail.clone() } else { req.message.clone() };
+        let embed = json!({
+            "title": format!("🛡️ Tyr watchdog alert — {}", req.kind),
+            "color": color,
+            "fields": [
+                json!({ "name": "Severity", "value": if req.severity.is_empty() { "unknown".into() } else { req.severity.clone() }, "inline": true }),
+                json!({ "name": "Repo", "value": if req.repo.is_empty() { "—".into() } else { req.repo.clone() }, "inline": true }),
+                json!({ "name": "Detail", "value": if detail.is_empty() { "—".into() } else { detail }, "inline": false }),
+            ],
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+        let _ = reqwest::Client::new().post(&webhook).json(&json!({ "embeds": [embed] })).send().await;
+    }
+
+    // High/critical → command Muninn to halt auto-fix until a human resumes.
+    let mut muninn_paused = false;
+    if critical {
+        let url = format!("{}/api/control", cfg.muninn_url);
+        match reqwest::Client::new().post(&url).json(&json!({ "pause": true })).send().await {
+            Ok(r) if r.status().is_success() => {
+                muninn_paused = true;
+                tracing::warn!("⏸️ Odin commanded Muninn PAUSE on Tyr {} alert", req.severity);
+            }
+            _ => tracing::warn!("⚠️ Odin could not command Muninn pause"),
+        }
+    }
+    Json(json!({ "received": true, "critical": critical, "muninn_paused": muninn_paused }))
+}
+
 // GET /api/reports/:scan_id - Returns ISO 27001 security report as HTML
 pub async fn get_report_html(
     Path(scan_id): Path<String>,

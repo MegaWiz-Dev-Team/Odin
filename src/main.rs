@@ -651,6 +651,7 @@ async fn main() {
         .route("/api/huginn-findings", post(findings::huginn_findings_handler))
         .route("/api/approvals", post(findings::muninn_approval_handler))
         .route("/api/plan-review", post(findings::plan_review_handler))
+        .route("/api/tyr-alert", post(findings::tyr_alert_handler))
         .route("/api/reports/{scan_id}", axum::routing::get(findings::get_report_html))
         .merge(protected)
         .with_state(chat_state)
