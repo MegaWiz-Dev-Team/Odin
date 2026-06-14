@@ -31,6 +31,13 @@ use crate::chat::ChatState;
 /// auth middleware on every protected /api route. Uses the OS RNG that seeds
 /// std's RandomState — no extra crate needed.
 static SESSION_TOKEN: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    // A fixed token (k8s Secret ODIN_SESSION_TOKEN) survives restarts, so a redeploy
+    // doesn't log every dashboard out. Falls back to a random token for local dev.
+    if let Ok(t) = std::env::var("ODIN_SESSION_TOKEN") {
+        if !t.trim().is_empty() {
+            return t;
+        }
+    }
     use std::hash::{BuildHasher, Hasher};
     let mut s = String::with_capacity(64);
     for _ in 0..4 {
@@ -172,6 +179,55 @@ async fn progress_proxy(State(state): State<ChatState>) -> impl IntoResponse {
         },
         None => Json(serde_json::json!({})),
     }
+}
+
+/// Forward an issue action (approve / reject / fix) to Muninn, preserving its
+/// status code so the dashboard sees a real result instead of a 405 from the
+/// static fallback. These back the UI's per-issue buttons.
+async fn issue_action_proxy(
+    state: ChatState,
+    id: String,
+    action: &str,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/api/issues/{}/{}", cfg.muninn_url, id, action);
+    match client.post(&url).send().await {
+        Ok(r) => {
+            let code = axum::http::StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let body = r
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            (code, Json(body))
+        }
+        Err(_) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "muninn unreachable" })),
+        ),
+    }
+}
+
+async fn approve_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "approve").await
+}
+
+async fn reject_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "reject").await
+}
+
+async fn trigger_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "fix").await
 }
 
 async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
@@ -656,6 +712,9 @@ async fn main() {
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
         .route("/api/muninn-progress", axum::routing::get(progress_proxy))
+        .route("/api/issues/{id}/approve", post(approve_proxy))
+        .route("/api/issues/{id}/reject", post(reject_proxy))
+        .route("/api/issues/{id}/fix", post(trigger_proxy))
         .layer(middleware::from_fn(require_auth));
 
     // Public — login (issues the token), the Huginn webhook (machine-to-machine),
