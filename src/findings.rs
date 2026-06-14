@@ -218,6 +218,8 @@ pub struct MuninnApprovalRequest {
     pub approve_url: Option<String>,
     #[serde(default)]
     pub reject_url: Option<String>,
+    #[serde(default)]
+    pub plan: String,
 }
 
 /// POST /api/approvals — Muninn asks Odin to get a human to approve a fix.
@@ -246,6 +248,15 @@ pub async fn muninn_approval_handler(
             "inline": false
         }),
     ];
+    if !req.plan.trim().is_empty() {
+        // Discord field values cap at 1024 chars.
+        let plan = if req.plan.chars().count() > 1000 {
+            format!("{}…", req.plan.chars().take(1000).collect::<String>())
+        } else {
+            req.plan.clone()
+        };
+        fields.push(json!({ "name": "🧠 Plan", "value": plan, "inline": false }));
+    }
     let action = match (&req.approve_url, &req.reject_url) {
         (Some(a), Some(r)) => format!("✅ [Approve]({})  ·  ❌ [Reject]({})", a, r),
         (Some(a), None) => format!("✅ [Approve]({})", a),
