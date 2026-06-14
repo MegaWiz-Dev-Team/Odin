@@ -181,6 +181,21 @@ pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Resul
             json_get(&client, &format!("{}/api/issues/{}", cfg.muninn_url, id)).await
         }
         "muninn_stats" => json_get(&client, &format!("{}/api/stats", cfg.muninn_url)).await,
+        "muninn_progress" => json_get(&client, &format!("{}/api/progress", cfg.muninn_url)).await,
+
+        // Muninn write-paths — Odin commands Muninn to fix.
+        "muninn_approve_fix" => {
+            let id = arg_str(args, "issue_id")?;
+            json_post(&client, &format!("{}/api/issues/{}/approve", cfg.muninn_url, id), &json!({}), None).await
+        }
+        "muninn_trigger_fix" => {
+            let id = arg_str(args, "issue_id")?;
+            json_post(&client, &format!("{}/api/issues/{}/fix", cfg.muninn_url, id), &json!({}), None).await
+        }
+        "muninn_reject_fix" => {
+            let id = arg_str(args, "issue_id")?;
+            json_post(&client, &format!("{}/api/issues/{}/reject", cfg.muninn_url, id), &json!({}), None).await
+        }
 
         "forseti_list_runs" => json_get(&client, &format!("{}/api/runs?limit=20", cfg.forseti_url)).await,
         "forseti_get_run" => {
@@ -1062,6 +1077,16 @@ pub fn tool_definitions() -> Value {
             "issue_id": { "type": "string", "description": "issue id" }
         })),
         tool("muninn_stats", "Muninn: aggregate issue stats", json!({})),
+        tool("muninn_progress", "Muninn: auto-fix pipeline progress — status breakdown (pending/fixing/review_pending/fixed/failed), pause state, in-flight fixes, and recently-fixed issues with PR links", json!({})),
+        tool("muninn_approve_fix", "Muninn: APPROVE a review_pending fix and command Muninn to run it (re-analyze → Claude Code → draft PR). Use after a human approves an L2/L3 finding in Discord.", json!({
+            "issue_id": { "type": "string", "description": "issue id" }
+        })),
+        tool("muninn_trigger_fix", "Muninn: command Muninn to fix an issue now (bypasses review gating). Prefer muninn_approve_fix for issues parked review_pending.", json!({
+            "issue_id": { "type": "string", "description": "issue id" }
+        })),
+        tool("muninn_reject_fix", "Muninn: reject a review_pending fix (marks the issue skipped).", json!({
+            "issue_id": { "type": "string", "description": "issue id" }
+        })),
 
         // Forseti — E2E testing
         tool("forseti_list_runs", "Forseti (E2E Testing): list recent test runs (limit 20)", json!({})),

@@ -408,6 +408,8 @@
         <div class="stat-card"><div class="stat-value" id="statFixed">—</div><div class="stat-label">Fixed</div></div>
         <div class="stat-card danger"><div class="stat-value" id="statFailed">—</div><div class="stat-label">Failed</div></div>
         <div class="stat-card info"><div class="stat-value" id="statPending">—</div><div class="stat-label">Analyzing</div></div>
+        <div class="stat-card"><div class="stat-value" id="statFixing">—</div><div class="stat-label">Fixing now</div></div>
+        <div class="stat-card" id="watchdogCard"><div class="stat-value" id="statWatchdog">—</div><div class="stat-label">Watchdog</div></div>
     </div>
 
     <div class="tabs">
@@ -719,6 +721,19 @@
             } catch (e) {
                 console.error('Config fetch failed:', e);
             }
+        }
+
+        // ── Fetch Muninn fix-pipeline progress ──
+        async function fetchProgress() {
+            try {
+                const p = await (await fetch('/api/muninn-progress', { headers: odinAuthHeaders() })).json();
+                const c = p.counts || {};
+                document.getElementById('statFixing').textContent = (c.fixing || 0);
+                const wd = document.getElementById('statWatchdog');
+                const card = document.getElementById('watchdogCard');
+                if (p.paused) { wd.textContent = '⏸ PAUSED'; card.classList.add('danger'); }
+                else { wd.textContent = '🟢 OK'; card.classList.remove('danger'); }
+            } catch (e) { /* muninn offline */ }
         }
 
         // ── Fetch issues ──
@@ -1057,8 +1072,9 @@
         function initDashboard() {
             fetchConfig();
             fetchIssues();
+            fetchProgress();
             if (dashInterval) clearInterval(dashInterval);
-            dashInterval = setInterval(() => { fetchConfig(); fetchIssues(); }, 30000);
+            dashInterval = setInterval(() => { fetchConfig(); fetchIssues(); fetchProgress(); }, 30000);
             toggleAuto();   // start the 10s issues auto-poll (checkbox defaults on)
             const u = document.getElementById('issuesUpdated');
             if (u) u.textContent = 'Updated ' + new Date().toLocaleTimeString();

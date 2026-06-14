@@ -7,6 +7,7 @@ use tracing::warn;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
+use crate::agents::AgentConfig;
 use crate::chat::{run_agent, ChatState};
 use crate::report;
 
@@ -199,6 +200,289 @@ async fn send_discord_notification(
             Ok(())
         }
     }
+}
+
+/// Approval request from Muninn (Thor rated a finding L2/L3 — needs human sign-off).
+#[derive(Deserialize)]
+pub struct MuninnApprovalRequest {
+    pub issue_id: String,
+    pub repo: String,
+    #[serde(default)]
+    pub issue_number: u64,
+    #[serde(default)]
+    pub title: String,
+    pub level: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub approve_url: Option<String>,
+    #[serde(default)]
+    pub reject_url: Option<String>,
+    #[serde(default)]
+    pub plan: String,
+}
+
+/// POST /api/approvals — Muninn asks Odin to get a human to approve a fix.
+/// Odin posts it to Discord (with approve/reject links). A human then approves —
+/// in Discord, or by having Odin call the `muninn_approve_fix` tool — which
+/// commands Muninn back to run the fix.
+pub async fn muninn_approval_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<MuninnApprovalRequest>,
+) -> Result<(), (StatusCode, String)> {
+    let cfg = &state.cfg;
+    tracing::info!("🗡️ Muninn approval request: {} {} ({})", req.issue_id, req.level, req.repo);
+
+    let Some(webhook_url) = cfg.discord_webhook_url.clone() else {
+        warn!("DISCORD_WEBHOOK_URL not set — approval {} not posted to Discord", req.issue_id);
+        return Ok(());
+    };
+
+    let color = if req.level == "L3" { 0xFF0000 } else { 0xFFA500 };
+    let mut fields = vec![
+        json!({ "name": "Repo", "value": format!("{}#{}", req.repo, req.issue_number), "inline": true }),
+        json!({ "name": "Risk", "value": req.level, "inline": true }),
+        json!({
+            "name": "Why",
+            "value": if req.reasons.is_empty() { "—".to_string() } else { req.reasons.join("\n") },
+            "inline": false
+        }),
+    ];
+    if !req.plan.trim().is_empty() {
+        // Discord field values cap at 1024 chars.
+        let plan = if req.plan.chars().count() > 1000 {
+            format!("{}…", req.plan.chars().take(1000).collect::<String>())
+        } else {
+            req.plan.clone()
+        };
+        fields.push(json!({ "name": "🧠 Plan", "value": plan, "inline": false }));
+    }
+    let action = match (&req.approve_url, &req.reject_url) {
+        (Some(a), Some(r)) => format!("✅ [Approve]({})  ·  ❌ [Reject]({})", a, r),
+        (Some(a), None) => format!("✅ [Approve]({})", a),
+        _ => format!("Approve via Odin: `muninn_approve_fix {}`", req.issue_id),
+    };
+    fields.push(json!({ "name": "Action", "value": action, "inline": false }));
+
+    let embed = json!({
+        "title": format!("⚡ Muninn fix needs approval — {}", req.title),
+        "color": color,
+        "fields": fields,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    let payload = json!({ "embeds": [embed] });
+
+    let client = reqwest::Client::new();
+    match client.post(&webhook_url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("✅ Approval request posted to Discord: {}", req.issue_id);
+        }
+        Ok(resp) => warn!("⚠️ Discord returned {} for approval {}", resp.status(), req.issue_id),
+        Err(e) => warn!("❌ Discord approval post failed: {}", e),
+    }
+    Ok(())
+}
+
+/// Muninn's fix-plan review request (Odin+Frigg advisory consensus).
+#[derive(Deserialize)]
+pub struct PlanReviewRequest {
+    pub issue_id: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub plan: Value,
+}
+
+/// POST /api/plan-review — Muninn asks the Odin+Frigg advisory panel to review a
+/// fix plan BEFORE any code is written. Odin (commander) judges feasibility,
+/// Frigg (advisor) judges safety; the two votes are combined by Thor's consensus
+/// policy. Fails safe to `reject` on any LLM error.
+pub async fn plan_review_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<PlanReviewRequest>,
+) -> Json<Value> {
+    let cfg = &state.cfg;
+    tracing::info!("🧠 plan-review for {} ({})", req.issue_id, req.repo);
+
+    let (odin_vote, frigg_vote, odin_reason, frigg_reason) = vote_on_plan(cfg, &req).await;
+    let cv = thor::evaluate_consensus(
+        &json!({ "odin": odin_vote, "frigg": frigg_vote }).to_string(),
+    );
+    tracing::info!(
+        "🧠 plan-review {} → {} (odin={}, frigg={})",
+        req.issue_id, cv.decision, odin_vote, frigg_vote
+    );
+    let mut conditions: Vec<String> = vec![];
+    if cv.decision != "approve" {
+        if odin_vote != "approve" && !odin_reason.is_empty() {
+            conditions.push(format!("Odin: {}", odin_reason));
+        }
+        if frigg_vote != "approve" && !frigg_reason.is_empty() {
+            conditions.push(format!("Frigg: {}", frigg_reason));
+        }
+    }
+
+    Json(json!({
+        "decision": cv.decision,
+        "can_proceed": cv.can_proceed,
+        "odin_vote": odin_vote,
+        "frigg_vote": frigg_vote,
+        "conditions": conditions,
+    }))
+}
+
+/// Two INDEPENDENT advisor votes on a plan: Odin (feasibility) and Frigg (safety)
+/// each get their own Heimdall call with a distinct prompt, run concurrently, so
+/// neither sees the other's reasoning. Returns (odin_vote, frigg_vote,
+/// odin_reason, frigg_reason). Each fails safe to reject.
+async fn vote_on_plan(cfg: &AgentConfig, req: &PlanReviewRequest) -> (String, String, String, String) {
+    let odin = one_vote(
+        cfg, req, "Odin, the commander",
+        "Is the approach FEASIBLE, in-scope, and MINIMAL? Reject scope creep, over-engineering, or a fix that doesn't address the root cause.",
+    );
+    let frigg = one_vote(
+        cfg, req, "Frigg, the advisor",
+        "Is it SAFE — small blast radius, easily reversible, free of auth/crypto/data/secret risk? Reject anything hard to revert or touching sensitive paths.",
+    );
+    let ((ov, or), (fv, fr)) = tokio::join!(odin, frigg);
+    (ov, fv, or, fr)
+}
+
+/// A single advisor's independent vote — one Heimdall call with its own persona
+/// and criteria. Fails safe to ("reject", …).
+async fn one_vote(cfg: &AgentConfig, req: &PlanReviewRequest, role: &str, criteria: &str) -> (String, String) {
+    let prompt = format!(
+        "You are {role}, an Asgard advisor reviewing Muninn's automated fix PLAN before any code is written.\n\
+         Issue: {} ({})\nPlan: {}\n\n\
+         Judge ONLY this: {criteria}\n\
+         Vote approve | conditional | reject — be conservative, prefer conditional/reject when unsure.\n\
+         Respond ONLY with JSON: {{\"vote\":\"approve|conditional|reject\",\"reason\":\"one short sentence\"}}",
+        req.title, req.repo, req.plan,
+    );
+    match heimdall_complete(cfg, &prompt).await {
+        Some(c) => parse_vote(&c),
+        None => ("reject".to_string(), "llm unreachable".to_string()),
+    }
+}
+
+/// One Heimdall chat completion → the assistant message text (None on error).
+async fn heimdall_complete(cfg: &AgentConfig, prompt: &str) -> Option<String> {
+    let body = json!({
+        "model": cfg.heimdall_model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 200,
+        "temperature": 0.1
+    });
+    let client = reqwest::Client::new();
+    let mut rb = client.post(format!("{}/v1/chat/completions", cfg.heimdall_url)).json(&body);
+    if let Some(k) = &cfg.heimdall_api_key {
+        rb = rb.header("Authorization", format!("Bearer {}", k));
+    }
+    match rb.send().await {
+        Ok(r) => {
+            let v: Value = r.json().await.unwrap_or_default();
+            v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).map(String::from)
+        }
+        Err(e) => {
+            warn!("plan-review LLM unreachable: {}", e);
+            None
+        }
+    }
+}
+
+/// Parse an advisor's `{vote, reason}` JSON out of the model text. Fails safe to
+/// ("reject", …) — an unknown or missing vote is a reject.
+fn parse_vote(content: &str) -> (String, String) {
+    let json_str = match (content.find('{'), content.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &content[a..=b],
+        _ => return ("reject".to_string(), "unparseable vote".to_string()),
+    };
+    match serde_json::from_str::<Value>(json_str) {
+        Ok(v) => {
+            let raw = v.get("vote").and_then(|x| x.as_str()).unwrap_or("reject").to_lowercase();
+            let vote = match raw.as_str() {
+                "approve" => "approve",
+                "conditional" => "conditional",
+                _ => "reject",
+            }
+            .to_string();
+            (vote, v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string())
+        }
+        Err(_) => ("reject".to_string(), "unparseable vote".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod plan_review_tests {
+    use super::parse_vote;
+
+    #[test]
+    fn parse_vote_normalizes_and_fails_safe() {
+        assert_eq!(parse_vote(r#"{"vote":"approve","reason":"ok"}"#), ("approve".to_string(), "ok".to_string()));
+        assert_eq!(parse_vote("noise {\"vote\":\"CONDITIONAL\",\"reason\":\"r\"} tail").0, "conditional");
+        assert_eq!(parse_vote("garbage no json").0, "reject");
+        assert_eq!(parse_vote(r#"{"vote":"maybe"}"#).0, "reject"); // unknown vote → reject
+    }
+}
+
+/// Tyr anomaly alert about the auto-fix watchdog (governance telemetry breached
+/// a Wazuh rule). Odin = the command layer.
+#[derive(Deserialize)]
+pub struct TyrAlertRequest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// POST /api/tyr-alert — Tyr's anomaly detection fires here. Odin posts it to
+/// Discord and, for high/critical alerts, COMMANDS Muninn to pause auto-fix
+/// (POST muninn /api/control). Tyr watches; Odin commands.
+pub async fn tyr_alert_handler(
+    State(state): State<ChatState>,
+    Json(req): Json<TyrAlertRequest>,
+) -> Json<Value> {
+    let cfg = &state.cfg;
+    let critical = matches!(req.severity.as_str(), "high" | "critical");
+    tracing::warn!("🛡️ Tyr alert: {} [{}] {} ({})", req.kind, req.severity, req.message, req.repo);
+
+    if let Some(webhook) = cfg.discord_webhook_url.clone() {
+        let color = if critical { 0xFF0000 } else { 0xFFA500 };
+        let detail = if req.message.is_empty() { req.detail.clone() } else { req.message.clone() };
+        let embed = json!({
+            "title": format!("🛡️ Tyr watchdog alert — {}", req.kind),
+            "color": color,
+            "fields": [
+                json!({ "name": "Severity", "value": if req.severity.is_empty() { "unknown".into() } else { req.severity.clone() }, "inline": true }),
+                json!({ "name": "Repo", "value": if req.repo.is_empty() { "—".into() } else { req.repo.clone() }, "inline": true }),
+                json!({ "name": "Detail", "value": if detail.is_empty() { "—".into() } else { detail }, "inline": false }),
+            ],
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+        let _ = reqwest::Client::new().post(&webhook).json(&json!({ "embeds": [embed] })).send().await;
+    }
+
+    // High/critical → command Muninn to halt auto-fix until a human resumes.
+    let mut muninn_paused = false;
+    if critical {
+        let url = format!("{}/api/control", cfg.muninn_url);
+        match reqwest::Client::new().post(&url).json(&json!({ "pause": true })).send().await {
+            Ok(r) if r.status().is_success() => {
+                muninn_paused = true;
+                tracing::warn!("⏸️ Odin commanded Muninn PAUSE on Tyr {} alert", req.severity);
+            }
+            _ => tracing::warn!("⚠️ Odin could not command Muninn pause"),
+        }
+    }
+    Json(json!({ "received": true, "critical": critical, "muninn_paused": muninn_paused }))
 }
 
 // GET /api/reports/:scan_id - Returns ISO 27001 security report as HTML
