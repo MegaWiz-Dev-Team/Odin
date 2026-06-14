@@ -512,8 +512,10 @@ pub async fn governance_audit_handler(
     } else {
         format!("{}#{}", req.repo, req.issue_number)
     };
+    // http_client() accepts the wazuh-indexer's self-signed cert; a plain
+    // reqwest::Client would fail TLS and silently drop the audit write.
     crate::agents::audit_event(
-        &reqwest::Client::new(),
+        &crate::agents::http_client(),
         &state.cfg,
         &action,
         json!({ "actor": "muninn", "target": target, "detail": req.detail,
