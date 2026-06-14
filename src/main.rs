@@ -31,6 +31,13 @@ use crate::chat::ChatState;
 /// auth middleware on every protected /api route. Uses the OS RNG that seeds
 /// std's RandomState — no extra crate needed.
 static SESSION_TOKEN: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    // A fixed token (k8s Secret ODIN_SESSION_TOKEN) survives restarts, so a redeploy
+    // doesn't log every dashboard out. Falls back to a random token for local dev.
+    if let Ok(t) = std::env::var("ODIN_SESSION_TOKEN") {
+        if !t.trim().is_empty() {
+            return t;
+        }
+    }
     use std::hash::{BuildHasher, Hasher};
     let mut s = String::with_capacity(64);
     for _ in 0..4 {
@@ -161,6 +168,95 @@ async fn health_proxy(State(state): State<ChatState>) -> impl IntoResponse {
 /// Proxy Muninn's tracked issues through Odin (browser can't reach Muninn's
 /// ClusterIP / localhost-only port-forward, esp. over Tailscale). Returns the
 /// raw JSON array, or [] on any failure so the UI degrades gracefully.
+/// Proxy Muninn's fix-pipeline progress to the dashboard (Odin UI).
+async fn progress_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    match client.get(format!("{}/api/progress", cfg.muninn_url)).send().await.ok() {
+        Some(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(_) => Json(serde_json::json!({})),
+        },
+        None => Json(serde_json::json!({})),
+    }
+}
+
+/// Forward an issue action (approve / reject / fix) to Muninn, preserving its
+/// status code so the dashboard sees a real result instead of a 405 from the
+/// static fallback. These back the UI's per-issue buttons.
+async fn issue_action_proxy(
+    state: ChatState,
+    id: String,
+    action: &str,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/api/issues/{}/{}", cfg.muninn_url, id, action);
+    match client.post(&url).send().await {
+        Ok(r) => {
+            let code = axum::http::StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let body = r
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            (code, Json(body))
+        }
+        Err(_) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "muninn unreachable" })),
+        ),
+    }
+}
+
+async fn approve_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "approve").await
+}
+
+async fn reject_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "reject").await
+}
+
+async fn trigger_proxy(
+    State(state): State<ChatState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    issue_action_proxy(state, id, "fix").await
+}
+
+/// Where a repo sits in the Asgard dependency stack — foundational services
+/// (everything builds on them) first, leaf apps last. Orders the issue table so
+/// the base of the stack is triaged before what depends on it.
+fn dep_tier(repo: &str) -> u8 {
+    let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
+    match name.as_str() {
+        "heimdall" => 0,
+        "yggdrasil" | "mimir" => 1,
+        "bifrost" | "thor" | "tyr" => 2,
+        "huginn" | "muninn" | "forseti" | "skuggi" | "hermodr" => 3,
+        "eir" | "syn" | "bragi" | "saga" | "laminar" | "nott" => 4,
+        "odin" => 5,
+        _ => 6,
+    }
+}
+
+/// Severity order: critical first, low last; unknown sorts last.
+fn prio_rank(p: &str) -> u8 {
+    match p.to_ascii_lowercase().as_str() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
 async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
@@ -171,7 +267,22 @@ async fn issues_proxy(State(state): State<ChatState>) -> impl IntoResponse {
         .ok();
     match body {
         Some(r) => match r.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
+            Ok(mut v) => {
+                // Order by severity, then dependency tier (base of the stack
+                // first), then repo + number for a stable ordering.
+                if let Some(arr) = v.as_array_mut() {
+                    arr.sort_by(|a, b| {
+                        let key = |x: &serde_json::Value| {
+                            let prio = x.get("priority").and_then(|p| p.as_str()).unwrap_or("");
+                            let repo = x.get("repo").and_then(|r| r.as_str()).unwrap_or("");
+                            let num = x.get("issue_number").and_then(|n| n.as_u64()).unwrap_or(0);
+                            (prio_rank(prio), dep_tier(repo), repo.to_string(), num)
+                        };
+                        key(a).cmp(&key(b))
+                    });
+                }
+                Json(v)
+            }
             Err(_) => Json(serde_json::json!([])),
         },
         None => Json(serde_json::json!([])),
@@ -194,6 +305,95 @@ async fn config_proxy(State(state): State<ChatState>) -> impl IntoResponse {
         },
         None => Json(serde_json::json!({})),
     }
+}
+
+/// One-page inspection roll-up: a status per SOC domain (Availability /
+/// Vulnerability / Remediation / Detection / Governance), each best-effort so one
+/// unreachable backend never fails the whole panel.
+async fn checks_proxy(State(state): State<ChatState>) -> impl IntoResponse {
+    use serde_json::json;
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+
+    // ── Availability ──
+    let svcs: [(&str, String); 5] = [
+        ("Heimdall", format!("{}/health", cfg.heimdall_url)),
+        ("Huginn", format!("{}/health", cfg.huginn_url)),
+        ("Muninn", format!("{}/health", cfg.muninn_url)),
+        ("Vardr", format!("{}/health", cfg.vardr_url)),
+        ("Loki", format!("{}/health", cfg.loki_url)),
+    ];
+    let mut up = 0u32;
+    for (_n, u) in &svcs {
+        if client.get(u).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+            up += 1;
+        }
+    }
+    let total = svcs.len() as u32;
+    checks.push(json!({
+        "domain": "Availability", "tool": "Vardr",
+        "status": if up == total { "ok" } else if up == 0 { "fail" } else { "warn" },
+        "metric": format!("{}/{} up", up, total), "detail": "core services responding"
+    }));
+
+    // ── Vulnerability (Huginn) ──
+    let v = match client.get(format!("{}/api/stats", cfg.huginn_url)).send().await.ok() {
+        Some(r) => r.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    match v {
+        Some(s) => {
+            let sev = s.get("by_severity").cloned().unwrap_or(json!({}));
+            let crit = sev.get("critical").and_then(|x| x.as_i64()).unwrap_or(0);
+            let high = sev.get("high").and_then(|x| x.as_i64()).unwrap_or(0);
+            let tf = s.get("total_findings").and_then(|x| x.as_i64()).unwrap_or(0);
+            checks.push(json!({
+                "domain": "Vulnerability", "tool": "Huginn",
+                "status": if crit > 0 { "fail" } else if high > 0 { "warn" } else { "ok" },
+                "metric": format!("{} findings", tf), "detail": format!("{} critical / {} high", crit, high)
+            }));
+        }
+        None => checks.push(json!({"domain":"Vulnerability","tool":"Huginn","status":"unknown","metric":"—","detail":"stats unavailable"})),
+    }
+
+    // ── Remediation (Muninn) ──
+    let r = match client.get(format!("{}/api/stats", cfg.muninn_url)).send().await.ok() {
+        Some(x) => x.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    match r {
+        Some(s) => {
+            let ti = s.get("total_issues").and_then(|x| x.as_i64()).unwrap_or(0);
+            let tf = s.get("total_fixes").and_then(|x| x.as_i64()).unwrap_or(0);
+            checks.push(json!({"domain":"Remediation","tool":"Muninn","status":"ok","metric":format!("{} issues",ti),"detail":format!("{} fixes",tf)}));
+        }
+        None => checks.push(json!({"domain":"Remediation","tool":"Muninn","status":"unknown","metric":"—","detail":"stats unavailable"})),
+    }
+
+    // ── Detection (Tyr indexer) ──
+    let det = client
+        .get(format!("{}/_cluster/health", cfg.tyr_indexer_url))
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send().await.map(|r| r.status().is_success()).unwrap_or(false);
+    checks.push(json!({"domain":"Detection","tool":"Tyr","status": if det {"ok"} else {"fail"},"metric": if det {"reachable"} else {"down"},"detail":"SIEM indexer"}));
+
+    // ── Governance (Thor audit trail) ──
+    let g = match client
+        .get(format!("{}/odin-audit/_count", cfg.tyr_indexer_url))
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send().await.ok()
+    {
+        Some(x) => x.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    let gc = g.and_then(|x| x.get("count").and_then(|c| c.as_i64())).unwrap_or(-1);
+    checks.push(json!({
+        "domain":"Governance","tool":"Thor","status": if gc >= 0 {"ok"} else {"unknown"},
+        "metric": if gc >= 0 { format!("{} decisions", gc) } else { "—".to_string() }, "detail":"policy audit trail"
+    }));
+
+    Json(json!({ "checks": checks }))
 }
 
 #[derive(Deserialize)]
@@ -546,12 +746,17 @@ async fn main() {
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/audit", axum::routing::get(audit_proxy))
+        .route("/api/checks", axum::routing::get(checks_proxy))
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))
         .route("/api/active-response", post(active_response))
         .route("/api/huginn/batch-status", post(huginn_batch_status))
         .route("/api/reports/save", post(save_report))
         .route("/api/config", axum::routing::get(config_proxy))
+        .route("/api/muninn-progress", axum::routing::get(progress_proxy))
+        .route("/api/issues/{id}/approve", post(approve_proxy))
+        .route("/api/issues/{id}/reject", post(reject_proxy))
+        .route("/api/issues/{id}/fix", post(trigger_proxy))
         .layer(middleware::from_fn(require_auth));
 
     // Public — login (issues the token), the Huginn webhook (machine-to-machine),
@@ -559,6 +764,9 @@ async fn main() {
     let app = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/huginn-findings", post(findings::huginn_findings_handler))
+        .route("/api/approvals", post(findings::muninn_approval_handler))
+        .route("/api/plan-review", post(findings::plan_review_handler))
+        .route("/api/tyr-alert", post(findings::tyr_alert_handler))
         .route("/api/reports/{scan_id}", axum::routing::get(findings::get_report_html))
         .merge(protected)
         .with_state(chat_state)
