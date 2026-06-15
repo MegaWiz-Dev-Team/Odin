@@ -407,6 +407,7 @@
         <div class="stat-card warning"><div class="stat-value" id="statReview">—</div><div class="stat-label">Pending Review</div></div>
         <div class="stat-card"><div class="stat-value" id="statFixed">—</div><div class="stat-label">Fixed</div></div>
         <div class="stat-card danger"><div class="stat-value" id="statFailed">—</div><div class="stat-label">Failed</div></div>
+        <div class="stat-card"><div class="stat-value" id="statManual">—</div><div class="stat-label">☁️ Manual fix</div></div>
         <div class="stat-card info"><div class="stat-value" id="statPending">—</div><div class="stat-label">Analyzing</div></div>
         <div class="stat-card"><div class="stat-value" id="statFixing">—</div><div class="stat-label">Fixing now</div></div>
         <div class="stat-card" id="watchdogCard"><div class="stat-value" id="statWatchdog">—</div><div class="stat-label">Watchdog</div></div>
@@ -762,15 +763,19 @@
         // ── Stats ──
         function updateStats(issues) {
             document.getElementById('statTotal').textContent = issues.length;
-            const reviewPending = issues.filter(i => i.status === 'review_pending').length;
-            const fixed = issues.filter(i => i.status === 'fixed').length;
-            const failed = issues.filter(i => i.status === 'failed').length;
-            const analyzing = issues.filter(i => ['pending', 'analyzing'].includes(i.status)).length;
-            
+            // Partition EVERY status so the cards sum to Total (no silent gap).
+            const cnt = arr => issues.filter(i => arr.includes(i.status)).length;
+            const reviewPending = cnt(['review_pending']);
+            const fixed = cnt(['fixed', 'merged']);
+            const failed = cnt(['failed', 'skipped']);
+            const analyzing = cnt(['pending', 'analyzing', 'analyzed']);
+            const manual = cnt(['manual_required']);
+
             document.getElementById('statReview').textContent = reviewPending;
             document.getElementById('statFixed').textContent = fixed;
             document.getElementById('statFailed').textContent = failed;
             document.getElementById('statPending').textContent = analyzing;
+            const sm = document.getElementById('statManual'); if (sm) sm.textContent = manual;
             document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
             // Update tab counts
             document.getElementById('tabReview').textContent = `👁️ Pending Review (${reviewPending})`;
