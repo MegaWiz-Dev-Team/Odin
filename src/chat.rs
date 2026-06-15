@@ -37,7 +37,9 @@ Odin does not handle patient data or medical workflows. Direct users to the **Ei
 - **Which findings auto-fix vs need a human**: in-repo code problems (missing security headers, CSP, CORS wildcard, dependency CVE bumps) are code-fixable → a PR. Cloud/infra problems (GCS/S3 bucket IAM, public-bucket ACL, DNS, cloud config) have no repo file to change → they end at `manual_required`; tell the user to apply the plan by hand (e.g. a `gcloud` command).\n\
 - **Cluster recovery runbook**: if the cluster degrades — pods stuck `Terminating`, `FailedCreatePodSandBox`, or the watchdog reports it unreachable — restart the OrbStack runtime: `orbctl stop` then `orbctl start` (NOT `orb restart`); PVC data survives (incident 2026-06-15-orbstack-runtime-wedge).\n\
 - **Watchdog coverage**: asgard-watchdog/preflight checks namespaces `asgard`, `asgard-infra`, `wazuh`. NOT covered (flag these if asked): `asgard-monitoring` (Grafana/Prometheus/Alertmanager — the monitoring stack itself), `asgard-rl` (bifrost-rl), and host services like Heimdall (launchd, not a pod).\n\
-- NEVER map a bare dashboard number to an unrelated scan finding just because the digits coincide (e.g. posture 31 is NOT nginx 1.31.x). If you cannot ground a number in an actual tool result, say you are not certain and offer to look it up — do not guess.\n\n\
+- NEVER map a bare dashboard number to an unrelated scan finding just because the digits coincide (e.g. posture 31 is NOT nginx 1.31.x). If you cannot ground a number in an actual tool result, say you are not certain and offer to look it up — do not guess.\n\
+- Muninn issues are a FLAT list — there are no epics, parent/child links, or groupings. NEVER claim an issue is an epic, grouped, or related to another unless a tool actually returned that link; `#N` is always one standalone issue.\n\
+- A **LIVE SYSTEM STATE** message gives the current counts — answer count/status questions from THOSE numbers and cite your source (e.g. 'per muninn_progress: ...'). If a tool did not return a fact, say you are not certain — never invent a plausible one.\n\n\
 **FORMATTING RULES:**\n\
 - Use markdown tables for structured data (metrics, alerts, test results).\n\
 - Use ```mermaid code blocks for workflow diagrams and relationships.\n\
@@ -46,6 +48,25 @@ Odin does not handle patient data or medical workflows. Direct users to the **Ei
 - Always summarize findings after tool calls — never end with only tool output.\n\
 If a tool is unreachable, say the service is unavailable. Never invent data.";
 
+/// Fetch Muninn's current state so the agent answers from real numbers, not from
+/// memory — the single biggest lever against hallucinating about our own data.
+/// Best-effort: returns None (no injection) if Muninn is unreachable.
+async fn live_grounding(cfg: &AgentConfig) -> Option<Value> {
+    let client = crate::agents::http_client();
+    let v: Value = client
+        .get(format!("{}/api/progress", cfg.muninn_url))
+        .send().await.ok()?
+        .json().await.ok()?;
+    Some(json!({ "role": "system", "content": format!(
+        "LIVE SYSTEM STATE — ground any answer about counts/statuses in THIS; do not \
+         recall from memory, and if a fact isn't here, call the matching tool instead \
+         of guessing.\nMuninn issue counts: {} | paused: {} | watch_org: {}",
+        v.get("counts").cloned().unwrap_or(json!({})),
+        v.get("paused").unwrap_or(&json!(false)),
+        v.get("watch_org").unwrap_or(&json!(""))
+    )}))
+}
+
 pub async fn run_agent(
     cfg: &Arc<AgentConfig>,
     messages: Vec<Value>,
@@ -53,6 +74,7 @@ pub async fn run_agent(
     let model = cfg.heimdall_model.clone();
     let mut messages: Vec<Value> = {
         let mut m = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+        if let Some(ctx) = live_grounding(cfg).await { m.push(ctx); }
         m.extend(messages);
         m
     };
@@ -174,6 +196,7 @@ pub async fn chat_handler(
 
     let stream = try_stream! {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+        if let Some(ctx) = live_grounding(&cfg).await { messages.push(ctx); }
         messages.extend(req.messages.into_iter());
         let tools = tool_definitions();
 
