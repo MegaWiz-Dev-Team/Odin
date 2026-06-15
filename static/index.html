@@ -967,6 +967,7 @@
         function formatStatus(s) {
             const map = { pending: '🔵 Pending', analyzing: '🔄 Analyzing', analyzed: '📋 Analyzed',
                 review_pending: '👁️ Review', fixing: '🔧 Fixing', fixed: '✅ Fixed',
+                merged: '🔀 Merged', manual_required: '☁️ Manual fix',
                 skipped: '⏭️ Skipped', failed: '❌ Failed' };
             return map[s] || s;
         }
