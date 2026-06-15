@@ -790,6 +790,28 @@
         }
 
         // ── Render Review Issues ──
+        // Tiny, XSS-safe markdown renderer for the analysis/plan blob: each
+        // "**Label:**" starts a line, **bold**, `code`, and "- " bullets render.
+        function mdLite(t) {
+            let s = (t || '').replace(/\s*\*\*([^*]+?:)\*\*/g, '\n**$1** ');
+            s = escapeHtml(s)
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>');
+            let out = '', inList = false;
+            for (const ln of s.split('\n')) {
+                const m = ln.match(/^\s*[-•]\s+(.+)/);
+                if (m) {
+                    if (!inList) { out += '<ul style="margin:.25rem 0 .25rem 1.1rem">'; inList = true; }
+                    out += '<li>' + m[1] + '</li>';
+                } else {
+                    if (inList) { out += '</ul>'; inList = false; }
+                    if (ln.trim()) out += '<div style="margin:.2rem 0">' + ln + '</div>';
+                }
+            }
+            if (inList) out += '</ul>';
+            return out;
+        }
+
         function renderReviewIssues(issues) {
             const container = document.getElementById('reviewList');
             const empty = document.getElementById('emptyReview');
@@ -809,7 +831,7 @@
                         ${i.fix_analysis ? `
                         <div class="review-analysis">
                             <h4>🧠 AI Analysis</h4>
-                            <p>${escapeHtml(i.fix_analysis)}</p>
+                            <div class="review-md">${mdLite(i.fix_analysis)}</div>
                         </div>` : ''}
                         ${i.fix_diff ? `
                         <h4 style="margin-bottom:0.5rem;font-size:0.9rem;">📝 Proposed Fix</h4>
