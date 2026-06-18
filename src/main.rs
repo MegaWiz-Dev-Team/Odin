@@ -66,6 +66,54 @@ async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> 
     }
 }
 
+/// Security response headers (defense-in-depth alongside ingress).
+///
+/// CSP is tailored to Odin's static dashboard: it loads highlight.js / marked /
+/// mermaid from cdn.jsdelivr.net and fonts from Google Fonts, and uses inline
+/// event handlers plus a few inline <script> blocks — so script/style keep
+/// 'unsafe-inline' and those CDNs are allowlisted. 'unsafe-eval' is omitted.
+/// Headers are inserted only when absent so an upstream ingress can override.
+async fn set_security_headers(req: Request, next: Next) -> Response {
+    use axum::http::{header, HeaderName, HeaderValue};
+
+    const CSP: &str = "default-src 'self'; \
+         script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+         style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; \
+         font-src 'self' data: https://fonts.gstatic.com; \
+         img-src 'self' data: blob: https:; \
+         connect-src 'self'; \
+         frame-ancestors 'none'; \
+         base-uri 'self'; \
+         form-action 'self'; \
+         object-src 'none'";
+
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    if !h.contains_key(header::CONTENT_SECURITY_POLICY) {
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    }
+    if !h.contains_key(header::X_CONTENT_TYPE_OPTIONS) {
+        h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    }
+    if !h.contains_key(header::X_FRAME_OPTIONS) {
+        h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    }
+    if !h.contains_key(header::REFERRER_POLICY) {
+        h.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
+    let permissions_policy = HeaderName::from_static("permissions-policy");
+    if !h.contains_key(&permissions_policy) {
+        h.insert(
+            permissions_policy,
+            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        );
+    }
+    res
+}
+
 #[derive(Deserialize)]
 struct LoginRequest {
     username: Option<String>,
@@ -774,7 +822,8 @@ async fn main() {
         .merge(protected)
         .with_state(chat_state)
         .fallback_service(static_dir)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(set_security_headers));
 
     // Spawn Discord bot in background if token is configured
     let discord_cfg = cfg.clone();
