@@ -71,10 +71,21 @@ pub async fn huginn_findings_handler(
     );
 
     if !req.github_issues.is_empty() {
-        context_msg.push_str("\n\nGitHub issues created:\n");
+        context_msg.push_str("\n\nGitHub issues created/updated for THIS scan (these are the ONLY ones — do not imply others exist):\n");
         for issue in &req.github_issues {
             context_msg.push_str(&format!("- [{}#{}]({}): {}\n", issue.repo, issue.number, issue.url, issue.finding_title));
         }
+    } else {
+        // The decisive guard against the observed Discord over-claim: with no issue
+        // created, the model used to narrate a "proposal" and a "confirm in the UI"
+        // CTA that never existed. State the ground truth so it cannot.
+        context_msg.push_str(
+            "\n\nGROUNDING — NO GitHub issue was created or queued for this scan (the findings \
+             duplicate existing open issues, or are below the action threshold). Therefore do NOT \
+             claim you 'prepared a proposal', 'filed an issue', or that anyone should 'confirm in \
+             the UI' — there is nothing pending review. Summarize the findings and give concrete \
+             remediation steps only.\n",
+        );
     }
 
     context_msg.push_str("\nTop findings:\n");

@@ -40,6 +40,7 @@ Odin does not handle patient data or medical workflows. Direct users to the **Ei
 - NEVER map a bare dashboard number to an unrelated scan finding just because the digits coincide (e.g. posture 31 is NOT nginx 1.31.x). If you cannot ground a number in an actual tool result, say you are not certain and offer to look it up — do not guess.\n\
 - Muninn issues are a FLAT list — there are no epics, parent/child links, or groupings. NEVER claim an issue is an epic, grouped, or related to another unless a tool actually returned that link; `#N` is always one standalone issue.\n\
 - A **LIVE SYSTEM STATE** message gives the current counts — answer count/status questions from THOSE numbers and cite your source (e.g. 'per muninn_progress: ...'). If a tool did not return a fact, say you are not certain — never invent a plausible one.\n\n\
+- **Never claim, unless a tool result grounds it:** (a) that Muninn will auto-fix / open a PR — true ONLY when `code_agent_provider` is not 'none'; (b) that a 'proposal' is prepared or that someone should 'confirm in the UI' — true ONLY when that issue's status is `review_pending`. When a scan creates no issue, say exactly that — never imply an action that did not happen.\n\n\
 **FORMATTING RULES:**\n\
 - Use markdown tables for structured data (metrics, alerts, test results).\n\
 - Use ```mermaid code blocks for workflow diagrams and relationships.\n\
@@ -50,21 +51,74 @@ If a tool is unreachable, say the service is unavailable. Never invent data.";
 
 /// Fetch Muninn's current state so the agent answers from real numbers, not from
 /// memory — the single biggest lever against hallucinating about our own data.
-/// Best-effort: returns None (no injection) if Muninn is unreachable.
+/// Best-effort: returns None (no injection) only if Muninn's progress is
+/// unreachable; stats/issues are folded in opportunistically.
 async fn live_grounding(cfg: &AgentConfig) -> Option<Value> {
     let client = crate::agents::http_client();
-    let v: Value = client
+    // progress is the anchor — if it fails, skip grounding entirely.
+    let progress: Value = client
         .get(format!("{}/api/progress", cfg.muninn_url))
         .send().await.ok()?
         .json().await.ok()?;
-    Some(json!({ "role": "system", "content": format!(
-        "LIVE SYSTEM STATE — ground any answer about counts/statuses in THIS; do not \
-         recall from memory, and if a fact isn't here, call the matching tool instead \
-         of guessing.\nMuninn issue counts: {} | paused: {} | watch_org: {}",
-        v.get("counts").cloned().unwrap_or(json!({})),
-        v.get("paused").unwrap_or(&json!(false)),
-        v.get("watch_org").unwrap_or(&json!(""))
-    )}))
+    // stats (code_agent_provider, total_fixes) + the flat issue list — best-effort.
+    let stats: Value = match client.get(format!("{}/api/stats", cfg.muninn_url)).send().await {
+        Ok(r) => r.json().await.unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+    let issues: Value = match client.get(format!("{}/api/issues", cfg.muninn_url)).send().await {
+        Ok(r) => r.json().await.unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+    Some(json!({ "role": "system", "content": build_grounding_content(&progress, &stats, &issues) }))
+}
+
+/// Compose the LIVE SYSTEM STATE block from Muninn's real progress/stats/issues.
+/// Pure (no I/O) so it is unit-tested. Beyond the counts, it injects the two facts
+/// Odin has been observed to invent: the auto-fix capability flag
+/// (`code_agent_provider`) and the COMPLETE flat issue list (so the model cannot
+/// fabricate an "Epic #N" or a pending "proposal" that does not exist).
+fn build_grounding_content(progress: &Value, stats: &Value, issues: &Value) -> String {
+    let counts = progress.get("counts").cloned().unwrap_or(json!({}));
+    let paused = progress.get("paused").cloned().unwrap_or(json!(false));
+    let watch_org = progress.get("watch_org").and_then(|v| v.as_str()).unwrap_or("");
+    let provider = stats.get("code_agent_provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let total_fixes = stats.get("total_fixes").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let watched = stats.get("watched_repos").and_then(|v| v.as_i64()).unwrap_or(-1);
+
+    // Flat one-line inventory `repo#num[status]` — proof there are no epics/children.
+    let list = issues.as_array().map(|arr| {
+        let mut v: Vec<String> = arr.iter().map(|x| {
+            let repo = x.get("repo").and_then(|r| r.as_str()).unwrap_or("?")
+                .rsplit('/').next().unwrap_or("?");
+            let num = x.get("issue_number").and_then(|n| n.as_i64()).unwrap_or(0);
+            let st = x.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            format!("{}#{}[{}]", repo, num, st)
+        }).collect();
+        v.sort();
+        v.join(", ")
+    }).unwrap_or_default();
+
+    let autofix = if provider.eq_ignore_ascii_case("none") {
+        format!(
+            "code_agent_provider=\"{}\" → Muninn CANNOT write auto-fix PRs right now (total_fixes={}). \
+             Do NOT claim auto-fix works or that a fix PR is/will be written automatically; \
+             code-fixable findings still need a human until a provider is configured.",
+            provider, total_fixes
+        )
+    } else {
+        format!("code_agent_provider=\"{}\" (total_fixes={})", provider, total_fixes)
+    };
+
+    format!(
+        "LIVE SYSTEM STATE — ground every count/status/issue answer in THIS block; do not \
+         recall from memory, and if a fact isn't here, call the matching tool instead of guessing.\n\
+         • Muninn issue counts: {counts} | paused: {paused} | watch_org: {watch_org} | watched_repos: {watched}\n\
+         • {autofix}\n\
+         • Open issues are a FLAT list — there are NO epics/parents/children/groupings. The COMPLETE set is exactly: [{list}]. \
+         If an issue number is not in this list it does not exist; never invent an 'Epic #N' or claim issues are grouped.\n\
+         • There is no separate 'proposal' queue. An item awaits human action ONLY if its status is review_pending. \
+         If review_pending is 0/absent, nothing is pending — do NOT tell anyone to 'confirm a proposal in the UI'.",
+    )
 }
 
 pub async fn run_agent(
@@ -404,4 +458,40 @@ fn sse_json(v: &Value) -> Event {
 
 fn sse_error(msg: String) -> Event {
     Event::default().data(json!({ "type": "error", "message": msg }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grounding_flags_no_autofix_and_lists_issues_flat() {
+        let progress = json!({
+            "counts": {"manual_required": 12, "merged": 1, "analyzing": 2},
+            "paused": false, "watch_org": "MegaWiz-Dev-Team"
+        });
+        let stats = json!({"code_agent_provider": "none", "total_fixes": 0, "watched_repos": 5});
+        let issues = json!([
+            {"repo": "MegaWiz-Dev-Team/Asgard", "issue_number": 99, "status": "manual_required"},
+            {"repo": "MegaWiz-Dev-Team/Bifrost", "issue_number": 22, "status": "manual_required"}
+        ]);
+        let s = build_grounding_content(&progress, &stats, &issues);
+        // (a) auto-fix is off → must say so, blocking the "Muninn will write a PR" claim
+        assert!(s.contains("CANNOT"), "must warn auto-fix unavailable when provider=none: {s}");
+        // (b) the flat issue list is injected verbatim → blocks invented "Epic #N"
+        assert!(s.contains("Asgard#99[manual_required]"), "issue list missing: {s}");
+        assert!(s.contains("Bifrost#22[manual_required]"));
+        assert!(s.contains("FLAT list"));
+        // (c) proposal/confirm semantics tied to review_pending → blocks the Discord over-claim
+        assert!(s.contains("review_pending"), "must explain proposal/confirm semantics: {s}");
+    }
+
+    #[test]
+    fn grounding_reports_provider_when_configured() {
+        let progress = json!({"counts": {}, "paused": false, "watch_org": "x"});
+        let stats = json!({"code_agent_provider": "claude-code", "total_fixes": 3, "watched_repos": 5});
+        let s = build_grounding_content(&progress, &stats, &json!([]));
+        assert!(!s.contains("CANNOT"), "configured provider must NOT trigger the can't-autofix warning: {s}");
+        assert!(s.contains("claude-code"));
+    }
 }
