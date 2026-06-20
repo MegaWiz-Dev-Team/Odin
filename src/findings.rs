@@ -28,6 +28,12 @@ pub struct HuginnFindingsRequest {
     pub _scan_type: String,
     pub findings: Vec<Value>,
     pub github_issues: Vec<GitHubIssue>,
+    // Total non-suppressed findings across ALL severities (Huginn already drops
+    // accepted-risk/suppressed titles before counting). `findings` only carries
+    // the high-severity slice, so this is what tells a clean scan (0) apart from
+    // a medium/low-only one — drives the 🟢/🟠 badge. Defaulted for older senders.
+    #[serde(default)]
+    pub finding_count: u64,
 }
 
 #[derive(Deserialize, Clone)]
@@ -134,8 +140,16 @@ async fn send_discord_notification(
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
 
-    let color = if critical_count > 0 { 0xFF0000 } else { 0xFF6600 };
-    let severity_emoji = if critical_count > 0 { "🔴" } else { "🟠" };
+    // 🔴 critical/high · 🟠 medium/low present · 🟢 clean (nothing left after
+    // Huginn drops suppressed/accepted-risk titles). A clean scan now reads green
+    // instead of a permanent orange.
+    let (color, severity_emoji) = if critical_count > 0 || high_count > 0 {
+        (0xFF0000, "🔴")
+    } else if req.finding_count > 0 {
+        (0xFF6600, "🟠")
+    } else {
+        (0x2ECC71, "🟢")
+    };
 
     let mut fields = vec![
         json!({
