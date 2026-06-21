@@ -15,7 +15,7 @@ use crate::agents::{AgentConfig, dispatch_tool, http_client, http_client_streami
 
 const MAX_TOOL_ITERATIONS: usize = 6;
 const SYSTEM_PROMPT: &str = "You are Odin, the Infrastructure Orchestrator for the Asgard AI Platform.\n\
-You monitor and investigate infrastructure, security, and reliability via read-only tools.\n\n\
+You monitor, investigate, AND remediate infrastructure, security, and reliability. You have read tools and ACTION tools — you can approve / reject / trigger Muninn fixes, merge PRs, file issues, and run active-response. You are NOT read-only; when asked to act, use the tool.\n\n\
 **Available Systems:**\n\
 - **Týr** (Wazuh SIEM): security alerts, agent health, rule listing, attack detection\n\
 - **Várðr** (Monitoring): service health, metrics, alert management, capacity planning\n\
@@ -28,6 +28,19 @@ You monitor and investigate infrastructure, security, and reliability via read-o
 - Use the **knowledge_search** tool to consult the NCSA *AI Security Guidelines* (แนวปฏิบัติการใช้ปัญญาประดิษฐ์อย่างมั่นคงปลอดภัย) when answering questions about AI/LLM-specific threats (Prompt Injection, Data/Model Poisoning, Model Extraction, AI supply-chain attacks), secure AI lifecycle, AI risk assessment, and recommended security controls. Ground such answers in retrieved passages and cite that the guidance comes from the NCSA AI Security Guidelines.\n\n\
 **For Medical/Patient Chat:**\n\
 Odin does not handle patient data or medical workflows. Direct users to the **Eir assistant** (integrated inside OpenEMR) for clinical questions, patient chart access, and medical document review.\n\n\
+**Knowing yourself — dashboard metrics (this UI computes these; they are NOT version numbers or scan values):**\n\
+- **Security Posture** is a 0–100 health score the dashboard computes as: `100 − (failed×10 + review_pending×5 + analyzing×2) − (offline_services×10) − (load_test_failures×10)`, floored at 0. A low number means many open/in-flight issues or offline services — it is NOT itself a vulnerability, and it rises as issues are approved/fixed. It is unrelated to any software version.\n\
+- The stat cards (Total Issues, Pending Review, Fixed, Failed, Analyzing, Manual fix, Fixing now, Watchdog) come from Muninn's `/api/progress`; the Policy/Audit feed is the `odin-audit` index (Thor L0–L3 verdicts + Odin governance actions).\n\
+- **Muninn issue lifecycle** — when asked about a status, call `muninn_progress` and ground the answer in the real counts; do not answer generically. Statuses: `pending`/`analyzing` = being analyzed; `review_pending` = waiting for a human Approve; `fixing` = a fix is being written; `fixed` = a code PR was opened; `merged` = that PR landed; **`manual_required`** = approved but NO code change was possible — it's an infra/cloud fix (e.g. GCS IAM, DNS) a human applies by hand per the plan; `failed` = the fix errored (the issue's `error` field says why); `skipped` = protected/no-fix. NOT every analyzed issue becomes review_pending — many end at `manual_required` or `merged`.\n\
+- **Your action tools** (use them, don't just describe): `muninn_approve_fix` / `muninn_reject_fix` / `muninn_trigger_fix` act on a Muninn issue; `muninn_progress` is the live fix-pipeline state; `merge_pr` merges a fix PR; `create_issue` files one; `active_response` runs a Tyr response. Offer + execute these when a user wants something done.\n\
+- **Thor governance tiers** (the Policy/Audit feed): L0 = auto-fix immediately; L1 = AI consensus (Odin + Frigg) on the plan, then auto-fix; **L2 = a human must Approve** before any change; L3 = critical, escalate. WHY a finding got its tier is the audit row's `detail` (e.g. 'security + production repo + medium severity + untrusted source' → L2).\n\
+- **Which findings auto-fix vs need a human**: in-repo code problems (missing security headers, CSP, CORS wildcard, dependency CVE bumps) are code-fixable → a PR. Cloud/infra problems (GCS/S3 bucket IAM, public-bucket ACL, DNS, cloud config) have no repo file to change → they end at `manual_required`; tell the user to apply the plan by hand (e.g. a `gcloud` command).\n\
+- **Cluster recovery runbook**: if the cluster degrades — pods stuck `Terminating`, `FailedCreatePodSandBox`, or the watchdog reports it unreachable — restart the OrbStack runtime: `orbctl stop` then `orbctl start` (NOT `orb restart`); PVC data survives (incident 2026-06-15-orbstack-runtime-wedge).\n\
+- **Watchdog coverage**: asgard-watchdog/preflight checks namespaces `asgard`, `asgard-infra`, `wazuh`. NOT covered (flag these if asked): `asgard-monitoring` (Grafana/Prometheus/Alertmanager — the monitoring stack itself), `asgard-rl` (bifrost-rl), and host services like Heimdall (launchd, not a pod).\n\
+- NEVER map a bare dashboard number to an unrelated scan finding just because the digits coincide (e.g. posture 31 is NOT nginx 1.31.x). If you cannot ground a number in an actual tool result, say you are not certain and offer to look it up — do not guess.\n\
+- Muninn issues are a FLAT list — there are no epics, parent/child links, or groupings. NEVER claim an issue is an epic, grouped, or related to another unless a tool actually returned that link; `#N` is always one standalone issue.\n\
+- A **LIVE SYSTEM STATE** message gives the current counts — answer count/status questions from THOSE numbers and cite your source (e.g. 'per muninn_progress: ...'). If a tool did not return a fact, say you are not certain — never invent a plausible one.\n\n\
+- **Never claim, unless a tool result grounds it:** (a) that Muninn will auto-fix / open a PR — true ONLY when `code_agent_provider` is not 'none'; (b) that a 'proposal' is prepared or that someone should 'confirm in the UI' — true ONLY when that issue's status is `review_pending`. When a scan creates no issue, say exactly that — never imply an action that did not happen.\n\n\
 **FORMATTING RULES:**\n\
 - Use markdown tables for structured data (metrics, alerts, test results).\n\
 - Use ```mermaid code blocks for workflow diagrams and relationships.\n\
@@ -36,6 +49,78 @@ Odin does not handle patient data or medical workflows. Direct users to the **Ei
 - Always summarize findings after tool calls — never end with only tool output.\n\
 If a tool is unreachable, say the service is unavailable. Never invent data.";
 
+/// Fetch Muninn's current state so the agent answers from real numbers, not from
+/// memory — the single biggest lever against hallucinating about our own data.
+/// Best-effort: returns None (no injection) only if Muninn's progress is
+/// unreachable; stats/issues are folded in opportunistically.
+async fn live_grounding(cfg: &AgentConfig) -> Option<Value> {
+    let client = crate::agents::http_client();
+    // progress is the anchor — if it fails, skip grounding entirely.
+    let progress: Value = client
+        .get(format!("{}/api/progress", cfg.muninn_url))
+        .send().await.ok()?
+        .json().await.ok()?;
+    // stats (code_agent_provider, total_fixes) + the flat issue list — best-effort.
+    let stats: Value = match client.get(format!("{}/api/stats", cfg.muninn_url)).send().await {
+        Ok(r) => r.json().await.unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+    let issues: Value = match client.get(format!("{}/api/issues", cfg.muninn_url)).send().await {
+        Ok(r) => r.json().await.unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+    Some(json!({ "role": "system", "content": build_grounding_content(&progress, &stats, &issues) }))
+}
+
+/// Compose the LIVE SYSTEM STATE block from Muninn's real progress/stats/issues.
+/// Pure (no I/O) so it is unit-tested. Beyond the counts, it injects the two facts
+/// Odin has been observed to invent: the auto-fix capability flag
+/// (`code_agent_provider`) and the COMPLETE flat issue list (so the model cannot
+/// fabricate an "Epic #N" or a pending "proposal" that does not exist).
+fn build_grounding_content(progress: &Value, stats: &Value, issues: &Value) -> String {
+    let counts = progress.get("counts").cloned().unwrap_or(json!({}));
+    let paused = progress.get("paused").cloned().unwrap_or(json!(false));
+    let watch_org = progress.get("watch_org").and_then(|v| v.as_str()).unwrap_or("");
+    let provider = stats.get("code_agent_provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let total_fixes = stats.get("total_fixes").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let watched = stats.get("watched_repos").and_then(|v| v.as_i64()).unwrap_or(-1);
+
+    // Flat one-line inventory `repo#num[status]` — proof there are no epics/children.
+    let list = issues.as_array().map(|arr| {
+        let mut v: Vec<String> = arr.iter().map(|x| {
+            let repo = x.get("repo").and_then(|r| r.as_str()).unwrap_or("?")
+                .rsplit('/').next().unwrap_or("?");
+            let num = x.get("issue_number").and_then(|n| n.as_i64()).unwrap_or(0);
+            let st = x.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            format!("{}#{}[{}]", repo, num, st)
+        }).collect();
+        v.sort();
+        v.join(", ")
+    }).unwrap_or_default();
+
+    let autofix = if provider.eq_ignore_ascii_case("none") {
+        format!(
+            "code_agent_provider=\"{}\" → Muninn CANNOT write auto-fix PRs right now (total_fixes={}). \
+             Do NOT claim auto-fix works or that a fix PR is/will be written automatically; \
+             code-fixable findings still need a human until a provider is configured.",
+            provider, total_fixes
+        )
+    } else {
+        format!("code_agent_provider=\"{}\" (total_fixes={})", provider, total_fixes)
+    };
+
+    format!(
+        "LIVE SYSTEM STATE — ground every count/status/issue answer in THIS block; do not \
+         recall from memory, and if a fact isn't here, call the matching tool instead of guessing.\n\
+         • Muninn issue counts: {counts} | paused: {paused} | watch_org: {watch_org} | watched_repos: {watched}\n\
+         • {autofix}\n\
+         • Open issues are a FLAT list — there are NO epics/parents/children/groupings. The COMPLETE set is exactly: [{list}]. \
+         If an issue number is not in this list it does not exist; never invent an 'Epic #N' or claim issues are grouped.\n\
+         • There is no separate 'proposal' queue. An item awaits human action ONLY if its status is review_pending. \
+         If review_pending is 0/absent, nothing is pending — do NOT tell anyone to 'confirm a proposal in the UI'.",
+    )
+}
+
 pub async fn run_agent(
     cfg: &Arc<AgentConfig>,
     messages: Vec<Value>,
@@ -43,6 +128,7 @@ pub async fn run_agent(
     let model = cfg.heimdall_model.clone();
     let mut messages: Vec<Value> = {
         let mut m = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+        if let Some(ctx) = live_grounding(cfg).await { m.push(ctx); }
         m.extend(messages);
         m
     };
@@ -164,6 +250,7 @@ pub async fn chat_handler(
 
     let stream = try_stream! {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+        if let Some(ctx) = live_grounding(&cfg).await { messages.push(ctx); }
         messages.extend(req.messages.into_iter());
         let tools = tool_definitions();
 
@@ -371,4 +458,40 @@ fn sse_json(v: &Value) -> Event {
 
 fn sse_error(msg: String) -> Event {
     Event::default().data(json!({ "type": "error", "message": msg }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grounding_flags_no_autofix_and_lists_issues_flat() {
+        let progress = json!({
+            "counts": {"manual_required": 12, "merged": 1, "analyzing": 2},
+            "paused": false, "watch_org": "MegaWiz-Dev-Team"
+        });
+        let stats = json!({"code_agent_provider": "none", "total_fixes": 0, "watched_repos": 5});
+        let issues = json!([
+            {"repo": "MegaWiz-Dev-Team/Asgard", "issue_number": 99, "status": "manual_required"},
+            {"repo": "MegaWiz-Dev-Team/Bifrost", "issue_number": 22, "status": "manual_required"}
+        ]);
+        let s = build_grounding_content(&progress, &stats, &issues);
+        // (a) auto-fix is off → must say so, blocking the "Muninn will write a PR" claim
+        assert!(s.contains("CANNOT"), "must warn auto-fix unavailable when provider=none: {s}");
+        // (b) the flat issue list is injected verbatim → blocks invented "Epic #N"
+        assert!(s.contains("Asgard#99[manual_required]"), "issue list missing: {s}");
+        assert!(s.contains("Bifrost#22[manual_required]"));
+        assert!(s.contains("FLAT list"));
+        // (c) proposal/confirm semantics tied to review_pending → blocks the Discord over-claim
+        assert!(s.contains("review_pending"), "must explain proposal/confirm semantics: {s}");
+    }
+
+    #[test]
+    fn grounding_reports_provider_when_configured() {
+        let progress = json!({"counts": {}, "paused": false, "watch_org": "x"});
+        let stats = json!({"code_agent_provider": "claude-code", "total_fixes": 3, "watched_repos": 5});
+        let s = build_grounding_content(&progress, &stats, &json!([]));
+        assert!(!s.contains("CANNOT"), "configured provider must NOT trigger the can't-autofix warning: {s}");
+        assert!(s.contains("claude-code"));
+    }
 }

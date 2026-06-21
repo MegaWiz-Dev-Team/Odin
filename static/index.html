@@ -407,6 +407,7 @@
         <div class="stat-card warning"><div class="stat-value" id="statReview">—</div><div class="stat-label">Pending Review</div></div>
         <div class="stat-card"><div class="stat-value" id="statFixed">—</div><div class="stat-label">Fixed</div></div>
         <div class="stat-card danger"><div class="stat-value" id="statFailed">—</div><div class="stat-label">Failed</div></div>
+        <div class="stat-card"><div class="stat-value" id="statManual">—</div><div class="stat-label">☁️ Manual fix</div></div>
         <div class="stat-card info"><div class="stat-value" id="statPending">—</div><div class="stat-label">Analyzing</div></div>
         <div class="stat-card"><div class="stat-value" id="statFixing">—</div><div class="stat-label">Fixing now</div></div>
         <div class="stat-card" id="watchdogCard"><div class="stat-value" id="statWatchdog">—</div><div class="stat-label">Watchdog</div></div>
@@ -420,6 +421,7 @@
         <div class="tab" data-tab="services" id="tabServices">🔌 Services</div>
         <div class="tab" data-tab="audit" id="tabAudit">🔨 Policy / Audit</div>
         <div class="tab" data-tab="checks" id="tabChecks">🩺 Checks</div>
+        <div class="tab" data-tab="watchdog" id="tabWatchdog">🐕 Watchdog</div>
     </div>
 
     <div class="content">
@@ -526,6 +528,11 @@
                 <button class="btn btn-approve" onclick="fetchChecks()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
             </div>
             <div id="checksGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px"></div>
+        </div>
+
+        <!-- Watchdog coverage — which services asgard-watchdog/preflight monitors -->
+        <div class="tab-content" id="contentWatchdog">
+            <div id="watchdogCoverage" style="margin-top:0.5rem"></div>
         </div>
     </div>
 
@@ -635,6 +642,7 @@
                 if (key === 'loadtests') fetchLoadTests();
                 if (key === 'audit') fetchAudit();
                 if (key === 'checks') fetchChecks();
+                if (key === 'watchdog') renderWatchdogCoverage();
             });
         });
         function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -655,6 +663,7 @@
                     const denied = /denied/.test(action);
                     const agents = Array.isArray(e.agents) ? e.agents.join(',') : (e.agents || '');
                     const target = e.repo ? (escA(e.repo) + (e.number ? ('#' + e.number) : ''))
+                        : e.target ? escA(e.target)
                         : e.command ? ('AR <code>' + escA(e.command) + '</code>' + (agents ? (' → ' + escA(agents)) : ''))
                         : escA(e.title || '—');
                     const decision = denied
@@ -663,6 +672,7 @@
                     const detail = (e.violations && e.violations.length) ? escA(e.violations.join('; '))
                         : (e.warnings && e.warnings.length) ? '⚠ ' + escA(e.warnings.join('; '))
                         : (e.thor_warnings && e.thor_warnings.length) ? '⚠ ' + escA(e.thor_warnings.join('; '))
+                        : e.detail ? escA(e.detail)
                         : (e.result ? escA(typeof e.result === 'string' ? e.result : JSON.stringify(e.result)) : '');
                     const ts = (e.ts || '').replace('T', ' ').slice(0, 19);
                     return `<tr><td style="white-space:nowrap;color:var(--text-muted);font-size:.75rem">${ts}</td>`
@@ -753,15 +763,19 @@
         // ── Stats ──
         function updateStats(issues) {
             document.getElementById('statTotal').textContent = issues.length;
-            const reviewPending = issues.filter(i => i.status === 'review_pending').length;
-            const fixed = issues.filter(i => i.status === 'fixed').length;
-            const failed = issues.filter(i => i.status === 'failed').length;
-            const analyzing = issues.filter(i => ['pending', 'analyzing'].includes(i.status)).length;
-            
+            // Partition EVERY status so the cards sum to Total (no silent gap).
+            const cnt = arr => issues.filter(i => arr.includes(i.status)).length;
+            const reviewPending = cnt(['review_pending']);
+            const fixed = cnt(['fixed', 'merged']);
+            const failed = cnt(['failed', 'skipped']);
+            const analyzing = cnt(['pending', 'analyzing', 'analyzed']);
+            const manual = cnt(['manual_required']);
+
             document.getElementById('statReview').textContent = reviewPending;
             document.getElementById('statFixed').textContent = fixed;
             document.getElementById('statFailed').textContent = failed;
             document.getElementById('statPending').textContent = analyzing;
+            const sm = document.getElementById('statManual'); if (sm) sm.textContent = manual;
             document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
             // Update tab counts
             document.getElementById('tabReview').textContent = `👁️ Pending Review (${reviewPending})`;
@@ -790,6 +804,83 @@
         }
 
         // ── Render Review Issues ──
+        // Tiny, XSS-safe markdown renderer for the analysis/plan blob: each
+        // "**Label:**" starts a line, **bold**, `code`, and "- " bullets render.
+        function mdLite(t) {
+            let s = (t || '').replace(/\s*\*\*([^*]+?:)\*\*/g, '\n**$1** ');
+            s = escapeHtml(s)
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>');
+            let out = '', inList = false;
+            for (const ln of s.split('\n')) {
+                const m = ln.match(/^\s*[-•]\s+(.+)/);
+                if (m) {
+                    if (!inList) { out += '<ul style="margin:.25rem 0 .25rem 1.1rem">'; inList = true; }
+                    out += '<li>' + m[1] + '</li>';
+                } else {
+                    if (inList) { out += '</ul>'; inList = false; }
+                    if (ln.trim()) out += '<div style="margin:.2rem 0">' + ln + '</div>';
+                }
+            }
+            if (inList) out += '</ul>';
+            return out;
+        }
+
+        // ── Watchdog coverage — what asgard-watchdog/preflight actually checks ──
+        const WATCHDOG_NS = ['asgard', 'asgard-infra', 'wazuh'];   // asgard-preflight KUBE_NS
+        const WATCHDOG_COVERAGE = [
+            { svc: 'Odin', repo: 'Odin', ns: 'asgard' },
+            { svc: 'Muninn', repo: 'Muninn', ns: 'asgard' },
+            { svc: 'Bifrost', repo: 'Bifrost', ns: 'asgard' },
+            { svc: 'Mimir API', repo: 'Mimir', ns: 'asgard' },
+            { svc: 'Eir + eir-gateway', repo: 'Eir', ns: 'asgard' },
+            { svc: 'Syn', repo: 'Syn', ns: 'asgard' },
+            { svc: 'Forseti', repo: 'Forseti', ns: 'asgard' },
+            { svc: 'Hermodr (+ variants)', repo: 'Hermodr', ns: 'asgard' },
+            { svc: 'Huginn', repo: 'Huginn', ns: 'asgard' },
+            { svc: 'Fenrir', repo: 'Fenrir', ns: 'asgard' },
+            { svc: 'Yggdrasil', repo: 'Yggdrasil', ns: 'asgard' },
+            { svc: 'Laminar', repo: 'Laminar', ns: 'asgard' },
+            { svc: 'MariaDB', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'Postgres', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'Neo4j', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'Qdrant', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'MinIO', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'Redis', repo: '(asgard/charts)', ns: 'asgard-infra' },
+            { svc: 'Wazuh / Týr (indexer·manager·dashboard)', repo: 'Tyr', ns: 'wazuh' },
+            // ── outside the watched namespaces ──
+            { svc: 'Bifrost-RL', repo: 'Bifrost', ns: 'asgard-rl', gap: true, note: 'ns not in KUBE_NS' },
+            { svc: 'Monitoring (Grafana / Prometheus / Alertmanager)', repo: '(kube-prometheus-stack)', ns: 'asgard-monitoring', gap: true, note: 'the monitoring stack itself is unwatched' },
+            { svc: 'Heimdall (LLM gateway)', repo: 'Heimdall', ns: 'host · launchd', gap: true, note: 'host service, not a k8s pod — needs its own probe' },
+            { svc: 'Thor (policy)', repo: 'Thor', ns: '(crate)', gap: true, note: 'compile-time crate — no runtime pod' },
+        ];
+        function renderWatchdogCoverage() {
+            const watched = WATCHDOG_COVERAGE.filter(s => !s.gap);
+            const gaps = WATCHDOG_COVERAGE.filter(s => s.gap);
+            const repoCell = s => (s.repo.startsWith('(') )
+                ? `<span style="color:var(--text-muted)">${escapeHtml(s.repo)}</span>`
+                : `<a href="https://github.com/MegaWiz-Dev-Team/${s.repo}" target="_blank">${escapeHtml(s.repo)}</a>`;
+            const row = s => `<tr style="border-bottom:1px solid var(--border)">
+                <td style="padding:.4rem .6rem">${escapeHtml(s.svc)}</td>
+                <td style="padding:.4rem .6rem"><code>${escapeHtml(s.ns)}</code></td>
+                <td style="padding:.4rem .6rem">${repoCell(s)}</td>
+                <td style="padding:.4rem .6rem;color:var(--text-muted);font-size:.85em">${s.note ? escapeHtml(s.note) : ''}</td></tr>`;
+            const tbl = (rows, col2) => `<table style="width:100%;border-collapse:collapse;margin:.3rem 0 1.2rem">
+                <thead><tr style="text-align:left;color:var(--text-muted);font-size:.78em;text-transform:uppercase">
+                <th style="padding:.4rem .6rem">Service</th><th style="padding:.4rem .6rem">${col2}</th>
+                <th style="padding:.4rem .6rem">Repo</th><th style="padding:.4rem .6rem">Note</th></tr></thead>
+                <tbody>${rows.map(row).join('')}</tbody></table>`;
+            document.getElementById('watchdogCoverage').innerHTML = `
+                <p style="margin-bottom:.7rem">🐕 <strong>asgard-watchdog</strong> runs <code>asgard-preflight</code> ~every 5&nbsp;min over
+                <code>${WATCHDOG_NS.join('</code>, <code>')}</code> —
+                <strong style="color:var(--mint-dark)">${watched.length} monitored</strong> ·
+                <strong style="color:var(--warning)">${gaps.length} outside coverage</strong>.</p>
+                <h4 style="color:var(--mint-dark);margin:.4rem 0">✅ Monitored (${watched.length})</h4>
+                ${tbl(watched, 'Namespace')}
+                <h4 style="color:var(--warning);margin:.4rem 0">⚠️ Not watched by pod-checks (${gaps.length})</h4>
+                ${tbl(gaps, 'Where')}`;
+        }
+
         function renderReviewIssues(issues) {
             const container = document.getElementById('reviewList');
             const empty = document.getElementById('emptyReview');
@@ -809,7 +900,7 @@
                         ${i.fix_analysis ? `
                         <div class="review-analysis">
                             <h4>🧠 AI Analysis</h4>
-                            <p>${escapeHtml(i.fix_analysis)}</p>
+                            <div class="review-md">${mdLite(i.fix_analysis)}</div>
                         </div>` : ''}
                         ${i.fix_diff ? `
                         <h4 style="margin-bottom:0.5rem;font-size:0.9rem;">📝 Proposed Fix</h4>
@@ -845,7 +936,7 @@
         async function approveFix(id) {
             if (!confirm('Approve this fix and create a Draft PR?')) return;
             try {
-                const res = await fetch(`${MUNINN_API}/api/issues/${id}/approve`, { method: 'POST' });
+                const res = await fetch(`/api/issues/${id}/approve`, { method: 'POST', headers: odinAuthHeaders() });
                 const data = await res.json();
                 alert(data.message || 'Fix approved!');
                 fetchIssues();
@@ -855,7 +946,7 @@
         async function rejectFix(id) {
             if (!confirm('Reject this fix? The issue will be marked as skipped.')) return;
             try {
-                const res = await fetch(`${MUNINN_API}/api/issues/${id}/reject`, { method: 'POST' });
+                const res = await fetch(`/api/issues/${id}/reject`, { method: 'POST', headers: odinAuthHeaders() });
                 const data = await res.json();
                 alert(data.message || 'Fix rejected.');
                 fetchIssues();
@@ -883,6 +974,7 @@
         function formatStatus(s) {
             const map = { pending: '🔵 Pending', analyzing: '🔄 Analyzing', analyzed: '📋 Analyzed',
                 review_pending: '👁️ Review', fixing: '🔧 Fixing', fixed: '✅ Fixed',
+                merged: '🔀 Merged', manual_required: '☁️ Manual fix',
                 skipped: '⏭️ Skipped', failed: '❌ Failed' };
             return map[s] || s;
         }
