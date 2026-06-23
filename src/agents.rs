@@ -32,6 +32,9 @@ pub struct AgentConfig {
     pub discord_token: Option<String>,
     pub discord_channel_id: String,
     pub discord_webhook_url: Option<String>,
+    // Discord user IDs allowed to COMMAND Odin. Empty = open (legacy). When set,
+    // everyone else can read the channel but their messages never reach the agent.
+    pub discord_allowed_users: Vec<u64>,
 }
 
 impl AgentConfig {
@@ -85,6 +88,11 @@ impl AgentConfig {
             discord_token: env::var("DISCORD_TOKEN").ok(),
             discord_channel_id: env::var("DISCORD_CHANNEL_ID").unwrap_or_default(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
+            discord_allowed_users: env::var("DISCORD_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
+                .collect(),
         }
     }
 }
@@ -111,6 +119,7 @@ pub fn http_client_streaming() -> Client {
 pub async fn dispatch_tool(cfg: &AgentConfig, name: &str, args: &Value) -> Result<Value> {
     let client = http_client();
     match name {
+        "get_watchdog_status" => watchdog_status(&client, cfg).await,
         "tyr_manager_info" => tyr_get(&client, cfg, "/manager/info").await,
         "tyr_list_agents" => tyr_get(&client, cfg, "/agents?limit=50&pretty=true").await,
         "tyr_list_rules" => tyr_get(&client, cfg, "/rules?limit=20").await,
@@ -472,6 +481,40 @@ pub async fn active_response_core(
             }
         }
         Err(e) => json!({ "status": "error", "error": format!("wazuh AR unreachable: {}", e) }),
+    }
+}
+
+// Read the asgard-watchdog live health snapshot (id=current) from OpenSearch.
+// The host-side watchdog publishes this every tick via asgard-preflight.
+pub async fn watchdog_status(client: &Client, cfg: &AgentConfig) -> Result<Value> {
+    let creds = format!("{}:{}", cfg.tyr_indexer_user, cfg.tyr_indexer_pass);
+    let basic = format!("Basic {}", B64.encode(creds.as_bytes()));
+    let url = format!("{}/asgard-alerts/_doc/current", cfg.tyr_indexer_url);
+    let res = client
+        .get(&url)
+        .header("Authorization", basic)
+        .send()
+        .await
+        .map_err(|e| anyhow!("indexer request failed: {}", e))?;
+    let v: Value = res
+        .json()
+        .await
+        .map_err(|e| anyhow!("indexer parse failed: {}", e))?;
+    match v.get("_source") {
+        Some(src) => Ok(json!({
+            "source": "asgard-watchdog (host-side health monitor, NOT Muninn)",
+            "overall": src.get("status"),
+            "exit_code": src.get("code"),
+            "failing_checks": src.get("fail"),
+            "warnings": src.get("warn"),
+            "last_check": src.get("ts").or_else(|| src.get("@timestamp")),
+            "host": src.get("host"),
+        })),
+        None => Ok(json!({
+            "source": "asgard-watchdog",
+            "overall": "unknown",
+            "note": "no current health snapshot yet — watchdog has not published since this feature was added (next tick within 5 min)"
+        })),
     }
 }
 
@@ -1033,6 +1076,7 @@ pub fn tool_definitions() -> Value {
             "query": { "type": "string", "description": "Lucene query, default '*' (last N alerts)" },
             "size": { "type": "integer", "description": "max alerts to return, default 20, max 100" }
         })),
+        tool("get_watchdog_status", "asgard-watchdog: the host-side INFRASTRUCTURE HEALTH monitor (runs asgard-preflight every 5 min, alerts to Discord). Returns CURRENT cluster health — overall OK/WARN/FAIL plus any failing checks: PVC stuck Terminating, wedged/ImagePull pods, node DiskPressure/MemoryPressure, MariaDB down, host services (Heimdall), stale DB backup. This is NOT Muninn (the auto-fixer). Use this for questions like 'watchdog status / is the system healthy / any problems'.", json!({})),
         tool("tyr_sca_results", "Týr SCA (Security Configuration Assessment): recent CIS-benchmark / hardening findings (failed checks). Use to report host config-hardening posture.", json!({
             "size": { "type": "integer", "description": "max findings, default 20, max 100" }
         })),

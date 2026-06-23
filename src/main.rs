@@ -7,7 +7,7 @@ mod policy;
 mod report;
 
 use axum::{
-    extract::{Json, Request, State},
+    extract::{Json, Path, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -478,6 +478,59 @@ async fn huginn_batch_status(
 /// tyr_bridge_create_issue, etc. Server-side (browser/Tailscale can't reach the
 /// indexer). Fetches match_all and sorts newest-first in-process (rfc3339 `ts`
 /// sorts lexicographically) to avoid the indexer text/fielddata sort gotcha.
+// List recent Odin chat sessions (metadata only — excludes the big messages blob).
+async fn sessions_list(State(state): State<ChatState>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/odin-sessions/_search", cfg.tyr_indexer_url);
+    let q = serde_json::json!({
+        "size": 50,
+        "sort": [{"ts": "desc"}],
+        "_source": ["session_id", "ts", "model", "turn_count", "preview"],
+        "query": {"match_all": {}}
+    });
+    let sessions: Vec<serde_json::Value> = match client
+        .post(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&q)
+        .send()
+        .await
+    {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .pointer("/hits/hits")
+                .and_then(|h| h.as_array())
+                .map(|a| a.iter().filter_map(|h| h.get("_source").cloned()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        },
+        Err(_) => vec![],
+    };
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+// Fetch one session's full transcript by id.
+async fn session_get(State(state): State<ChatState>, Path(id): Path<String>) -> impl IntoResponse {
+    let cfg = state.cfg.clone();
+    let client = crate::agents::http_client();
+    let url = format!("{}/odin-sessions/_doc/{}", cfg.tyr_indexer_url, id);
+    match client
+        .get(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .send()
+        .await
+    {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => match v.get("_source").cloned() {
+                Some(src) => Json(src).into_response(),
+                None => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"}))).into_response(),
+            },
+            Err(_) => (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": "indexer parse error"}))).into_response(),
+        },
+        Err(_) => (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": "indexer unreachable"}))).into_response(),
+    }
+}
+
 async fn audit_proxy(State(state): State<ChatState>) -> impl IntoResponse {
     let cfg = state.cfg.clone();
     let client = crate::agents::http_client();
@@ -746,6 +799,8 @@ async fn main() {
         .route("/api/health-proxy", axum::routing::get(health_proxy))
         .route("/api/issues", axum::routing::get(issues_proxy))
         .route("/api/audit", axum::routing::get(audit_proxy))
+        .route("/api/sessions", axum::routing::get(sessions_list))
+        .route("/api/sessions/{id}", axum::routing::get(session_get))
         .route("/api/checks", axum::routing::get(checks_proxy))
         .route("/api/issues/create", post(create_issue))
         .route("/api/pulls/merge", post(merge_pr))

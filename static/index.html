@@ -431,6 +431,13 @@
                 <div style="font-size:0.8rem;color:var(--text-muted)" id="issuesUpdated">—</div>
                 <div style="display:flex;gap:0.6rem;align-items:center">
                     <label style="font-size:0.78rem;color:var(--text-muted);display:flex;align-items:center;gap:0.3rem;cursor:pointer">
+                        Show
+                        <select id="issueFilter" onchange="applyIssueFilter()" style="padding:0.25rem 0.4rem;font-size:0.78rem;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer">
+                            <option value="open" selected>Open</option>
+                            <option value="all">All</option>
+                        </select>
+                    </label>
+                    <label style="font-size:0.78rem;color:var(--text-muted);display:flex;align-items:center;gap:0.3rem;cursor:pointer">
                         <input type="checkbox" id="autoRefresh" checked onchange="toggleAuto()"> Auto (10s)
                     </label>
                     <button class="btn btn-approve" id="refreshIssues" onclick="refreshNow()" style="padding:0.4rem 1rem;font-size:0.8rem">↻ Refresh</button>
@@ -746,6 +753,15 @@
             } catch (e) { /* muninn offline */ }
         }
 
+        // ── Issue filter (Open vs All) ──
+        // "Resolved" = the fix PR landed (`merged`) or no fix was needed
+        // (`skipped`); these are hidden by default and shown only when "All"
+        // is selected. lastIssues caches the last fetch so the dropdown can
+        // re-render without a round-trip.
+        const ISSUE_DONE_STATUSES = ['merged', 'skipped'];
+        let lastIssues = [];
+        function applyIssueFilter() { renderAllIssues(lastIssues); }
+
         // ── Fetch issues ──
         async function fetchIssues() {
             try {
@@ -786,11 +802,30 @@
 
         // ── Render All Issues ──
         function renderAllIssues(issues) {
+            lastIssues = issues;
+            const filter = (document.getElementById('issueFilter') || {}).value || 'open';
+            // "Open" (default) hides resolved issues — those whose fix PR landed
+            // (`merged`) or that need no fix (`skipped`). "All" shows everything.
+            const shown = filter === 'all'
+                ? issues
+                : issues.filter(i => !ISSUE_DONE_STATUSES.includes(i.status));
             const tbody = document.getElementById('allIssuesBody');
             const empty = document.getElementById('emptyAll');
-            if (issues.length === 0) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+            if (shown.length === 0) {
+                tbody.innerHTML = '';
+                const h3 = empty.querySelector('h3'), p = empty.querySelector('p');
+                if (filter !== 'all' && issues.length > 0) {
+                    if (h3) h3.textContent = 'No open issues';
+                    if (p) p.textContent = 'All tracked issues are resolved — choose “All” to see them.';
+                } else {
+                    if (h3) h3.textContent = 'No tracked issues';
+                    if (p) p.textContent = 'Muninn is watching for Huginn findings. Issues will appear here automatically.';
+                }
+                empty.style.display = 'block';
+                return;
+            }
             empty.style.display = 'none';
-            tbody.innerHTML = issues.map(i => `
+            tbody.innerHTML = shown.map(i => `
                 <tr>
                     <td><strong>${i.repo.split('/')[1] || i.repo}</strong></td>
                     <td><a href="https://github.com/${i.repo}/issues/${i.issue_number}" target="_blank">#${i.issue_number}</a></td>
@@ -1186,6 +1221,7 @@
         <div class="oc-head">
             <div class="t">🏛️ Ask Odin <small>· AI SOC analyst</small></div>
             <div style="display:flex;gap:.3rem;align-items:center">
+                <button onclick="ocNewSession()" aria-label="New chat" title="New conversation">🆕</button>
                 <button onclick="odinMaximize()" id="odinMaxBtn" aria-label="Maximize" title="Maximize / restore">⤢</button>
                 <button onclick="odinToggleChat()" aria-label="Close">✕</button>
             </div>
@@ -1206,6 +1242,10 @@
     <script>
         const ocMsgs = document.getElementById('ocMsgs');
         let ocHistory = [], ocBusy = false;
+        // Stable per-browser session id → conversation persists & resumes across reloads/restarts
+        let ocSessionId = localStorage.getItem('odin_session') || ('sess-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+        localStorage.setItem('odin_session', ocSessionId);
+        let ocRestored = false;
         function odinMaximize(){
             const p = document.getElementById('odinChat');
             const on = p.classList.toggle('maximized');
@@ -1235,9 +1275,30 @@
             const open = p.classList.toggle('open');
             f.classList.toggle('open', open);
             f.textContent = open ? '✕' : '💬';
-            if(open) setTimeout(()=>document.getElementById('ocInput').focus(), 80);
+            if(open){ ocRestore(); setTimeout(()=>document.getElementById('ocInput').focus(), 80); }
         }
         function odinAsk(chip){ document.getElementById('ocInput').value = chip.textContent.trim(); odinSend(); }
+        // Resume the persisted conversation for this session (server-side, survives restart)
+        async function ocRestore(){
+            if(ocRestored || ocHistory.length) return;
+            ocRestored = true;
+            try {
+                const r = await fetch('/api/sessions/' + encodeURIComponent(ocSessionId), { headers: odinAuthHeaders() });
+                if(!r.ok) return;
+                const s = await r.json();
+                const msgs = (s.messages || []).filter(m => (m.role==='user' || m.role==='assistant') && m.content);
+                if(!msgs.length) return;
+                const empty = document.getElementById('ocEmpty'); if(empty) empty.remove();
+                for(const m of msgs){ ocAdd(m.role, m.content); ocHistory.push({ role: m.role, content: m.content }); }
+            } catch(e){}
+        }
+        // Start a fresh conversation (new session id, clear transcript)
+        function ocNewSession(){
+            ocSessionId = 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+            localStorage.setItem('odin_session', ocSessionId);
+            ocHistory = []; ocRestored = true;
+            ocMsgs.innerHTML = '<div id="ocEmpty" class="oc-empty">เริ่มสนทนาใหม่</div>';
+        }
         function ocAdd(role, text){
             const d = document.createElement('div'); d.className = 'oc-msg ' + role;
             d.innerHTML = '<div class="r">' + role + '</div><div class="b">' + (text ? marked.parse(text) : '') + '</div>';
@@ -1379,7 +1440,7 @@
             let firstChunk = true;
             const clearTyping = () => { if(firstChunk){ body.innerHTML=''; firstChunk=false; } };
             try {
-                const res = await fetch('/api/chat', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ messages: ocHistory }) });
+                const res = await fetch('/api/chat', { method:'POST', headers: odinAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ messages: ocHistory, session_id: ocSessionId }) });
                 const reader = res.body.getReader(), dec = new TextDecoder();
                 let buf = '', acc = '';
                 while(true){
