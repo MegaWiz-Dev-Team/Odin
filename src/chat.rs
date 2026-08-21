@@ -239,6 +239,45 @@ pub struct ChatState {
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub messages: Vec<Value>,
+    // Client-supplied stable id so a conversation persists/resumes across reloads
+    // and Odin restarts. Generated from a timestamp if absent.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+// Persist the full conversation transcript to OpenSearch `odin-sessions` (same
+// tyr-indexer pattern as `odin-audit`). PUT with a deterministic id → one doc
+// per session, always the latest full transcript. Best-effort: never blocks chat.
+async fn persist_session(cfg: &AgentConfig, session_id: &str, messages: &[Value], model: &str) {
+    let client = http_client();
+    let url = format!("{}/odin-sessions/_doc/{}", cfg.tyr_indexer_url, session_id);
+    let preview: String = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("")
+        .chars()
+        .take(140)
+        .collect();
+    let turn_count = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .count();
+    let body = json!({
+        "session_id": session_id,
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "model": model,
+        "source": "odin-chat",
+        "turn_count": turn_count,
+        "preview": preview,
+        "messages": messages,
+    });
+    let _ = client
+        .put(&url)
+        .basic_auth(cfg.tyr_indexer_user.clone(), Some(cfg.tyr_indexer_pass.clone()))
+        .json(&body)
+        .send()
+        .await;
 }
 
 pub async fn chat_handler(
@@ -247,6 +286,10 @@ pub async fn chat_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let cfg = state.cfg.clone();
     let model = cfg.heimdall_model.clone();
+    let session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("sess-{}", chrono::Utc::now().timestamp_millis()));
 
     let stream = try_stream! {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
@@ -399,6 +442,9 @@ pub async fn chat_handler(
             let _ = &finish_reason;
             let has_tool_calls = tool_calls.iter().any(|(_, name, _, _)| !name.is_empty());
             if !has_tool_calls {
+                // final answer — record it and persist the full transcript
+                messages.push(json!({"role": "assistant", "content": assistant_text}));
+                persist_session(&cfg, &session_id, &messages, &model).await;
                 yield sse_json(&json!({"type":"done"}));
                 return;
             }
@@ -442,6 +488,7 @@ pub async fn chat_handler(
             }
 
             if iter == MAX_TOOL_ITERATIONS - 1 {
+                persist_session(&cfg, &session_id, &messages, &model).await;
                 yield sse_error("max tool iterations reached".into());
                 return;
             }

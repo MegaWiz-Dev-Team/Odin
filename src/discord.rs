@@ -44,6 +44,16 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Authorization gate: when an allowlist is configured, only those user IDs
+        // may COMMAND Odin. Everyone else can read the channel, but their messages
+        // never reach the agent — a 🔒 reaction signals "read-only for you".
+        if !self.cfg.discord_allowed_users.is_empty()
+            && !self.cfg.discord_allowed_users.contains(&msg.author.id.get())
+        {
+            let _ = msg.react(&ctx, '🔒').await;
+            return;
+        }
+
         let _ = msg.channel_id.broadcast_typing(&ctx).await;
 
         let mut history = self.history.lock().await;
